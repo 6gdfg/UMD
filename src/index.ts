@@ -14,7 +14,19 @@ const games = new Map<string, Game>();
 const playerRooms = new Map<string, string>();
 
 // 创建HTTP服务器
-const server = createServer();
+// Handle plain HTTP requests so a reverse proxy (e.g. nginx) doesn't wait forever.
+const server = createServer((req, res) => {
+  if (req.url === '/healthz') {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('ok');
+    return;
+  }
+
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.end('UMD game server is running. Use WebSocket on this host/port.');
+});
 
 // 创建WebSocket服务器
 const wss = new WebSocketServer({ server });
