@@ -446,15 +446,24 @@ export class Game {
           // 下一个玩家摸2张
           const nextPlayer = this.players[this.getNextPlayerIndex()];
           this.drawCardsForPlayer(nextPlayer, 2);
+          // +2: penalized player draws and loses their turn
+          nextPlayer.isSkipped = true;
+          this.broadcast({
+            type: 'PLAYER_SKIPPED',
+            playerId: nextPlayer.id
+          });
           break;
 
         case CardType.WILD_DRAW_FOUR:
           // 所有其他玩家摸4张
-          for (const p of this.players) {
-            if (p.id !== player.id) {
-              this.drawCardsForPlayer(p, 4);
-            }
-          }
+          const nextPlayerForDraw4 = this.players[this.getNextPlayerIndex()];
+          this.drawCardsForPlayer(nextPlayerForDraw4, 4);
+          // +4: penalized player draws and loses their turn
+          nextPlayerForDraw4.isSkipped = true;
+          this.broadcast({
+            type: 'PLAYER_SKIPPED',
+            playerId: nextPlayerForDraw4.id
+          });
           break;
       }
     }
@@ -835,7 +844,18 @@ export class Game {
    * 下一回合
    */
   private nextTurn(): void {
-    this.currentPlayerIndex = this.getNextPlayerIndex();
+    // Move to the next player, automatically consuming any "skip" flags.
+    if (this.players.length === 0) return;
+
+    let nextIndex = this.getNextPlayerIndex();
+    for (let i = 0; i < this.players.length; i++) {
+      const candidate = this.players[nextIndex];
+      if (!candidate.isSkipped) break;
+      candidate.isSkipped = false;
+      nextIndex = (nextIndex + this.turnDirection + this.players.length) % this.players.length;
+    }
+
+    this.currentPlayerIndex = nextIndex;
     
     this.broadcast({
       type: 'TURN_CHANGED',
