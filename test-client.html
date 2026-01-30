@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UMD卡牌游戏 - 测试客户端</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f0f0f0;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        h1 { color: #333; }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            margin: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover { background: #45a049; }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        input {
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        #log {
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .card {
+            display: inline-block;
+            padding: 5px 10px;
+            margin: 3px;
+            border: 2px solid #333;
+            border-radius: 4px;
+            cursor: pointer;
+            background: white;
+        }
+        .card.selected {
+            background: #ffeb3b;
+            border-color: #f57c00;
+        }
+        .card.red { border-color: #f44336; color: #f44336; }
+        .card.yellow { border-color: #ffeb3b; color: #f57f17; }
+        .card.blue { border-color: #2196f3; color: #2196f3; }
+        .card.green { border-color: #4caf50; color: #4caf50; }
+        .card.wild { border-color: #9c27b0; color: #9c27b0; font-weight: bold; }
+        #hand {
+            min-height: 60px;
+            background: #e8f5e9;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .status {
+            padding: 10px;
+            background: #e3f2fd;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎮 UMD卡牌游戏测试客户端</h1>
+
+    <div class="container">
+        <h2>连接设置</h2>
+        <input type="text" id="serverUrl" value="ws://localhost:3000" placeholder="服务器地址">
+        <input type="text" id="playerName" placeholder="玩家名称">
+        <button onclick="connect()">连接服务器</button>
+        <button onclick="disconnect()">断开连接</button>
+    </div>
+
+    <div class="container">
+        <h2>房间操作</h2>
+        <button onclick="createRoom()">创建房间</button>
+        <input type="text" id="roomIdInput" placeholder="房间ID">
+        <button onclick="joinRoom()">加入房间</button>
+        <button onclick="startGame()">开始游戏</button>
+    </div>
+
+    <div class="container status" id="status">
+        状态: 未连接
+    </div>
+
+    <div class="container">
+        <h2>我的手牌</h2>
+        <div id="hand"></div>
+        <div style="margin-top: 10px;">
+            <button onclick="playSelectedCards()">出牌</button>
+            <button onclick="drawCard()">摸牌</button>
+            <button onclick="pass()">Pass</button>
+            <button onclick="declareUno()">宣告UNO</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <h2>游戏信息</h2>
+        <div id="gameInfo"></div>
+    </div>
+
+    <div class="container">
+        <h2>消息日志</h2>
+        <div id="log"></div>
+    </div>
+
+    <script>
+        let ws = null;
+        let playerId = null;
+        let roomId = null;
+        let myHand = [];
+        let selectedCards = [];
+
+        function log(message) {
+            const logDiv = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            logDiv.innerHTML += `[${time}] ${message}<br>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function updateStatus(text) {
+            document.getElementById('status').textContent = '状态: ' + text;
+        }
+
+        function connect() {
+            const serverUrl = document.getElementById('serverUrl').value;
+            const playerName = document.getElementById('playerName').value || '测试玩家';
+
+            ws = new WebSocket(serverUrl);
+
+            ws.onopen = () => {
+                log('✅ 已连接到服务器');
+                updateStatus('已连接');
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                log(`📨 收到: ${JSON.stringify(message)}`);
+                handleMessage(message);
+            };
+
+            ws.onclose = () => {
+                log('❌ 连接已关闭');
+                updateStatus('未连接');
+            };
+
+            ws.onerror = (error) => {
+                log(`❌ 错误: ${error}`);
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function createRoom() {
+            if (!ws) {
+                alert('请先连接服务器');
+                return;
+            }
+            const playerName = document.getElementById('playerName').value || '测试玩家';
+            ws.send(JSON.stringify({
+                type: 'CREATE_ROOM',
+                playerName: playerName
+            }));
+        }
+
+        function joinRoom() {
+            if (!ws) {
+                alert('请先连接服务器');
+                return;
+            }
+            const targetRoomId = document.getElementById('roomIdInput').value;
+            if (!targetRoomId) {
+                alert('请输入房间ID');
+                return;
+            }
+            const playerName = document.getElementById('playerName').value || '测试玩家';
+            ws.send(JSON.stringify({
+                type: 'JOIN_ROOM',
+                roomId: targetRoomId,
+                playerName: playerName
+            }));
+        }
+
+        function startGame() {
+            if (!ws || !roomId) {
+                alert('请先加入房间');
+                return;
+            }
+            ws.send(JSON.stringify({
+                type: 'START_GAME'
+            }));
+        }
+
+        function playSelectedCards() {
+            if (selectedCards.length === 0) {
+                alert('请先选择要出的牌');
+                return;
+            }
+            ws.send(JSON.stringify({
+                type: 'PLAYER_ACTION',
+                action: {
+                    type: 'PLAY_CARDS',
+                    cards: selectedCards
+                }
+            }));
+            selectedCards = [];
+        }
+
+        function drawCard() {
+            ws.send(JSON.stringify({
+                type: 'PLAYER_ACTION',
+                action: {
+                    type: 'DRAW_CARD'
+                }
+            }));
+        }
+
+        function pass() {
+            ws.send(JSON.stringify({
+                type: 'PLAYER_ACTION',
+                action: {
+                    type: 'PASS'
+                }
+            }));
+        }
+
+        function declareUno() {
+            ws.send(JSON.stringify({
+                type: 'PLAYER_ACTION',
+                action: {
+                    type: 'DECLARE_UNO'
+                }
+            }));
+        }
+
+        function handleMessage(message) {
+            switch (message.type) {
+                case 'ROOM_CREATED':
+                case 'ROOM_JOINED':
+                    playerId = message.playerId;
+                    roomId = message.roomId;
+                    updateStatus(`在房间 ${roomId}`);
+                    log(`✅ 房间ID: ${roomId}, 玩家ID: ${playerId}`);
+                    break;
+
+                case 'GAME_STATE':
+                    myHand = message.gameState.players.find(p => p.id === playerId)?.hand || [];
+                    renderHand();
+                    renderGameInfo(message.gameState);
+                    break;
+
+                case 'GAME_OVER':
+                    alert(`游戏结束！获胜者: ${message.winnerName}`);
+                    break;
+            }
+        }
+
+        function renderHand() {
+            const handDiv = document.getElementById('hand');
+            handDiv.innerHTML = '';
+            
+            myHand.forEach(card => {
+                const cardDiv = document.createElement('div');
+                cardDiv.className = 'card';
+                
+                // 添加颜色类
+                const colorMap = {'红': 'red', '黄': 'yellow', '蓝': 'blue', '绿': 'green', '万能': 'wild'};
+                cardDiv.classList.add(colorMap[card.color] || '');
+                
+                cardDiv.textContent = `${card.color}${card.value}`;
+                cardDiv.onclick = () => toggleCardSelection(card, cardDiv);
+                handDiv.appendChild(cardDiv);
+            });
+        }
+
+        function toggleCardSelection(card, cardDiv) {
+            const index = selectedCards.findIndex(c => c.id === card.id);
+            if (index > -1) {
+                selectedCards.splice(index, 1);
+                cardDiv.classList.remove('selected');
+            } else {
+                selectedCards.push(card);
+                cardDiv.classList.add('selected');
+            }
+        }
+
+        function renderGameInfo(gameState) {
+            const infoDiv = document.getElementById('gameInfo');
+            infoDiv.innerHTML = `
+                <p><strong>游戏阶段:</strong> ${gameState.phase}</p>
+                <p><strong>当前玩家:</strong> ${gameState.currentPlayerId}</p>
+                <p><strong>方向:</strong> ${gameState.turnDirection === 1 ? '顺时针' : '逆时针'}</p>
+                <p><strong>牌堆剩余:</strong> ${gameState.deckCount}张</p>
+                <p><strong>上一手牌:</strong> ${gameState.lastPlayedHand.length}张 (${gameState.lastPlayedHandType || '无'})</p>
+                <p><strong>玩家列表:</strong></p>
+                <ul>
+                    ${gameState.players.map(p => `
+                        <li>${p.name} - ${p.handCount}张牌 ${p.hasCalledUno ? '(UNO!)' : ''}</li>
+                    `).join('')}
+                </ul>
+            `;
+        }
+    </script>
+</body>
+</html>
