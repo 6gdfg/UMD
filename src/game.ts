@@ -17,6 +17,7 @@ export enum HandType {
   SINGLE = 'single',
   PAIR = 'pair',
   TRIPLE = 'triple',
+  FULL_HOUSE = 'full_house',
   STRAIGHT = 'straight',
   CONSECUTIVE_PAIRS = 'consecutive_pairs',
   AIRPLANE = 'airplane',
@@ -26,6 +27,7 @@ export enum HandType {
 export interface PlayerAction {
   type: 'PLAY_CARDS' | 'DRAW_CARD' | 'CHI' | 'PENG' | 'GANG' | 'DECLARE_UNO' | 'PASS';
   cards?: Card[];
+  selectedColor?: string;
   playerId: string;
 }
 
@@ -34,6 +36,11 @@ export interface PotentialAction {
   playerId: string;
   cards: Card[];
   targetCard: Card;
+}
+
+interface ClaimStep {
+  playerId: string;
+  actions: PotentialAction[];
 }
 
 export class Game {
@@ -46,8 +53,12 @@ export class Game {
   lastPlayedHand: Card[] = [];
   lastPlayedHandType: HandType | null = null;
   lastPlayedBy: string | null = null;
+  currentColor: CardColor | null = null;
+  pendingEffect: { card: Card; playedById: string; chosenColor: CardColor | null } | null = null;
   pendingActions: PotentialAction[] = [];
   actionTimeout: NodeJS.Timeout | null = null;
+  claimQueue: ClaimStep[] = [];
+  claimQueueIndex: number = 0;
   roomId: string;
   hasActiveRound: boolean = false;
   passCount: number = 0;
@@ -121,7 +132,7 @@ export class Game {
 
     switch (action.type) {
       case 'PLAY_CARDS':
-        this.handlePlayCards(player, action.cards || []);
+        this.handlePlayCards(player, action.cards || [], action.selectedColor);
         break;
       case 'DRAW_CARD':
         this.handleDrawCard(player);
@@ -144,7 +155,7 @@ export class Game {
     }
   }
 
-  private handlePlayCards(player: Player, cards: Card[]): void {
+  private handlePlayCards(player: Player, cards: Card[], selectedColor?: string): void {
     if (this.players[this.currentPlayerIndex].id !== player.id) {
       this.sendToPlayer(player.id, {
         type: 'ACTION_VALIDATION',
@@ -184,6 +195,17 @@ export class Game {
       return;
     }
 
+    const chosenColor = this.parseSelectedColor(selectedColor);
+    const hasWild = cards.some(c => c.type === CardType.WILD || c.type === CardType.WILD_DRAW_FOUR);
+    if (hasWild && !chosenColor) {
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '出万能牌时必须选择变色后的颜色'
+      });
+      return;
+    }
+
     if (!this.isValidPlay(cards, this.lastPlayedHand, handType)) {
       this.sendToPlayer(player.id, {
         type: 'ACTION_VALIDATION',
@@ -201,12 +223,26 @@ export class Game {
     this.hasActiveRound = true;
     this.passCount = 0;
 
+    if (handType !== HandType.SINGLE) {
+      if (
+        handType === HandType.STRAIGHT ||
+        handType === HandType.CONSECUTIVE_PAIRS ||
+        handType === HandType.AIRPLANE ||
+        handType === HandType.FULL_HOUSE
+      ) {
+        this.currentColor = null;
+      } else if (cards.length > 0 && cards[0].color !== CardColor.WILD) {
+        this.currentColor = cards[0].color;
+      }
+    }
+
     this.broadcast({
       type: 'CARDS_PLAYED',
       playerId: player.id,
       cards: cards,
       handType: handType,
-      remainingCards: player.hand.length
+      remainingCards: player.hand.length,
+      chosenColor: chosenColor
     });
 
     if (player.hand.length === 0) {
@@ -227,18 +263,146 @@ export class Game {
       }, 5000);
     }
 
-    this.applyCardEffects(cards, player);
-
     if (handType === HandType.SINGLE) {
-      this.findPotentialActions(cards[0], player);
-    } else {
-      this.nextTurn();
+      // Give other players a chance to CHI/PENG/GANG before this card's effect triggers.
+      this.pendingEffect = { card: cards[0], playedById: player.id, chosenColor };
+      const hasClaims = this.findPotentialActions(cards[0], player);
+      if (!hasClaims) {
+        this.resolvePendingEffectNoClaim();
+      }
+      return;
     }
+
+    // For non-single hands, apply effects once (if any) and advance the turn.
+    this.applyCardEffects([cards[0]], player, chosenColor);
+    this.nextTurn();
   }
 
   /**
    * 识别牌型
    */
+  private parseSelectedColor(selectedColor?: string): CardColor | null {
+    if (!selectedColor) return null;
+    const normalized = selectedColor.trim().toUpperCase();
+
+    switch (normalized) {
+      case 'RED':
+        return CardColor.RED;
+      case 'YELLOW':
+        return CardColor.YELLOW;
+      case 'BLUE':
+        return CardColor.BLUE;
+      case 'GREEN':
+        return CardColor.GREEN;
+      default:
+        break;
+    }
+
+    const values = Object.values(CardColor) as unknown as string[];
+    if (values.includes(selectedColor)) return selectedColor as unknown as CardColor;
+    return null;
+  }
+
+  private resolvePendingEffectNoClaim(): void {
+    if (this.actionTimeout) {
+      clearTimeout(this.actionTimeout);
+      this.actionTimeout = null;
+    }
+
+    this.pendingActions = [];
+    this.claimQueue = [];
+    this.claimQueueIndex = 0;
+
+    const pending = this.pendingEffect;
+    if (!pending) return;
+    this.pendingEffect = null;
+
+    const playedByIndex = this.players.findIndex(p => p.id === pending.playedById);
+    if (playedByIndex >= 0) {
+      this.currentPlayerIndex = playedByIndex;
+    }
+
+    if (pending.card.type !== CardType.WILD && pending.card.type !== CardType.WILD_DRAW_FOUR) {
+      this.currentColor = pending.card.color;
+    }
+
+    this.applyCardEffects([pending.card], this.players[this.currentPlayerIndex], pending.chosenColor);
+    this.nextTurn();
+  }
+
+  private promptNextClaimCandidate(): void {
+    if (this.actionTimeout) {
+      clearTimeout(this.actionTimeout);
+      this.actionTimeout = null;
+    }
+
+    if (this.claimQueueIndex >= this.claimQueue.length) {
+      this.pendingActions = [];
+      this.claimQueue = [];
+      this.claimQueueIndex = 0;
+      this.resolvePendingEffectNoClaim();
+      return;
+    }
+
+    const step = this.claimQueue[this.claimQueueIndex];
+    this.pendingActions = step.actions;
+
+    const targetCard = step.actions[0]?.targetCard;
+    const type = step.actions[0]?.type;
+
+    this.sendToPlayer(step.playerId, {
+      type: 'POTENTIAL_ACTION',
+      actions: type ? [type] : [],
+      targetCard,
+      candidates: step.actions.map(a => ({ type: a.type, cards: a.cards }))
+    });
+
+    this.actionTimeout = setTimeout(() => {
+      this.pendingActions = [];
+      this.claimQueueIndex++;
+      this.promptNextClaimCandidate();
+    }, 5000);
+  }
+
+  private removeCardFromDiscardPile(cardId: string): void {
+    for (let i = this.discardPile.length - 1; i >= 0; i--) {
+      const group = this.discardPile[i];
+      const idx = group.findIndex(c => c.id === cardId);
+      if (idx === -1) continue;
+      group.splice(idx, 1);
+      if (group.length === 0) {
+        this.discardPile.splice(i, 1);
+      }
+      return;
+    }
+  }
+
+  private startNewRoundWithLeader(leaderId: string): void {
+    this.hasActiveRound = false;
+    this.passCount = 0;
+    this.lastPlayedHand = [];
+    this.lastPlayedHandType = null;
+    this.lastPlayedBy = null;
+    this.currentColor = null;
+    this.pendingEffect = null;
+
+    const leaderIndex = this.players.findIndex(p => p.id === leaderId);
+    if (leaderIndex >= 0) {
+      this.currentPlayerIndex = leaderIndex;
+    }
+
+    this.broadcast({
+      type: 'NEW_ROUND',
+      leadPlayerId: leaderId,
+      message: 'Claimed discard; new round starts'
+    });
+
+    this.broadcast({
+      type: 'TURN_CHANGED',
+      currentPlayerId: this.players[this.currentPlayerIndex]?.id
+    });
+  }
+
   private identifyHandType(cards: Card[]): HandType | null {
     if (cards.length === 0) return null;
 
@@ -250,7 +414,11 @@ export class Game {
     if (allSame) {
       if (cards.length === 2) return HandType.PAIR;
       if (cards.length === 3) return HandType.TRIPLE;
-      if (cards.length === 4) return HandType.BOMB;
+      if (cards.length >= 4) return HandType.BOMB;
+    }
+
+    if (cards.length === 5 && this.isFullHouse(cards)) {
+      return HandType.FULL_HOUSE;
     }
 
     // 检查顺子（5张以上连续数字）
@@ -286,49 +454,59 @@ export class Game {
   }
 
   private isConsecutivePairs(cards: Card[]): boolean {
-    const pairs: number[] = [];
-    const cardMap = new Map<string, Card[]>();
-    
+    const counts = new Map<number, number>();
+
     for (const card of cards) {
       if (card.type !== CardType.NUMBER) return false;
-      const key = `${card.color}-${card.value}`;
-      if (!cardMap.has(key)) cardMap.set(key, []);
-      cardMap.get(key)!.push(card);
+      const value = parseInt(card.value);
+      counts.set(value, (counts.get(value) || 0) + 1);
     }
 
-    for (const [key, group] of cardMap) {
-      if (group.length !== 2) return false;
-      pairs.push(parseInt(group[0].value));
+    const values = Array.from(counts.keys()).sort((a, b) => a - b);
+    for (const v of values) {
+      if (counts.get(v) !== 2) return false;
     }
 
-    pairs.sort((a, b) => a - b);
-    for (let i = 1; i < pairs.length; i++) {
-      if (pairs[i] !== pairs[i - 1] + 1) return false;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i] !== values[i - 1] + 1) return false;
     }
-    return true;
+
+    return values.length * 2 === cards.length;
   }
 
   private isAirplane(cards: Card[]): boolean {
-    const triples: number[] = [];
-    const cardMap = new Map<string, Card[]>();
-    
+    const counts = new Map<number, number>();
+
     for (const card of cards) {
       if (card.type !== CardType.NUMBER) return false;
-      const key = `${card.color}-${card.value}`;
-      if (!cardMap.has(key)) cardMap.set(key, []);
-      cardMap.get(key)!.push(card);
+      const value = parseInt(card.value);
+      counts.set(value, (counts.get(value) || 0) + 1);
     }
 
-    for (const [key, group] of cardMap) {
-      if (group.length !== 3) return false;
-      triples.push(parseInt(group[0].value));
+    const values = Array.from(counts.keys()).sort((a, b) => a - b);
+    for (const v of values) {
+      if (counts.get(v) !== 3) return false;
     }
 
-    triples.sort((a, b) => a - b);
-    for (let i = 1; i < triples.length; i++) {
-      if (triples[i] !== triples[i - 1] + 1) return false;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i] !== values[i - 1] + 1) return false;
     }
-    return true;
+
+    return values.length * 3 === cards.length;
+  }
+
+  private isFullHouse(cards: Card[]): boolean {
+    const counts = new Map<number, number>();
+
+    for (const card of cards) {
+      if (card.type !== CardType.NUMBER) return false;
+      const value = parseInt(card.value);
+      counts.set(value, (counts.get(value) || 0) + 1);
+    }
+
+    if (counts.size !== 2) return false;
+    const sortedCounts = Array.from(counts.values()).sort((a, b) => a - b);
+    return sortedCounts[0] === 2 && sortedCounts[1] === 3;
   }
 
   /**
@@ -343,7 +521,8 @@ export class Game {
 
     // 炸弹可以压任何牌
     if (handType === HandType.BOMB) {
-      return true;
+      if (this.lastPlayedHandType !== HandType.BOMB) return true;
+      return this.compareBombs(playedCards, lastCards);
     }
 
     // 牌型必须一致
@@ -354,10 +533,12 @@ export class Game {
     // 根据牌型比较大小
     switch (handType) {
       case HandType.SINGLE:
-        return this.compareSingleCards(playedCards[0], lastCards[0]);
+        return this.isValidSinglePlay(playedCards[0], lastCards[0]);
       case HandType.PAIR:
       case HandType.TRIPLE:
         return this.compareGroups(playedCards, lastCards);
+      case HandType.FULL_HOUSE:
+        return playedCards.length === lastCards.length;
       case HandType.STRAIGHT:
       case HandType.CONSECUTIVE_PAIRS:
       case HandType.AIRPLANE:
@@ -392,39 +573,68 @@ export class Game {
   /**
    * 比较对子/三张
    */
+  private isValidSinglePlay(played: Card, last: Card): boolean {
+    // UNO rules (plus bombs handled at hand-type level):
+    // - Wild / +4 can be played on anything
+    // - Otherwise: match current color OR match symbol/value
+    // - After a wild, the "current color" is the chosen color
+
+    if (played.type === CardType.WILD || played.type === CardType.WILD_DRAW_FOUR) {
+      return true;
+    }
+
+    const activeColor = this.currentColor ?? (last.color !== CardColor.WILD ? last.color : null);
+
+    // If the last card is a wild, only the chosen color (or another wild handled above) is allowed.
+    if (last.type === CardType.WILD || last.type === CardType.WILD_DRAW_FOUR) {
+      return !!activeColor && played.color === activeColor;
+    }
+
+    // Match color: any card allowed.
+    if (activeColor && played.color === activeColor) {
+      return true;
+    }
+
+    // Match value/symbol.
+    if (last.type === CardType.NUMBER) {
+      return played.type === CardType.NUMBER && played.value === last.value;
+    }
+
+    return played.type === last.type;
+  }
+
   private compareGroups(played: Card[], last: Card[]): boolean {
-    return this.compareSingleCards(played[0], last[0]);
+    return this.isValidSinglePlay(played[0], last[0]);
   }
 
   /**
    * 比较顺子/连对/飞机
    */
   private compareSequences(played: Card[], last: Card[]): boolean {
-    if (played.length !== last.length) return false;
-    
-    const playedMax = Math.max(...played.map(c => parseInt(c.value)));
-    const lastMax = Math.max(...last.map(c => parseInt(c.value)));
-    
-    return playedMax > lastMax;
+    // For these combo hands, only the format (hand type + length) matters.
+    return played.length === last.length;
   }
 
   /**
    * 比较炸弹
    */
   private compareBombs(played: Card[], last: Card[]): boolean {
-    const playedValue = parseInt(played[0].value);
-    const lastValue = parseInt(last[0].value);
-    return playedValue > lastValue;
+    if (played.length !== last.length) {
+      return played.length > last.length;
+    }
+
+    const playedPower = getCardPower(played[0]);
+    const lastPower = getCardPower(last[0]);
+    return playedPower > lastPower;
   }
 
   /**
    * 应用卡牌效果
    */
-  private applyCardEffects(cards: Card[], player: Player): void {
+  private applyCardEffects(cards: Card[], player: Player, chosenColor: CardColor | null): void {
     for (const card of cards) {
       switch (card.type) {
-        case CardType.SKIP:
-          // 跳过下一个玩家
+        case CardType.SKIP: {
           const nextIndex = this.getNextPlayerIndex();
           this.players[nextIndex].isSkipped = true;
           this.broadcast({
@@ -432,156 +642,200 @@ export class Game {
             playerId: this.players[nextIndex].id
           });
           break;
+        }
 
-        case CardType.REVERSE:
-          // 反转方向
+        case CardType.REVERSE: {
           this.turnDirection *= -1;
           this.broadcast({
             type: 'DIRECTION_REVERSED',
             newDirection: this.turnDirection
           });
-          break;
 
-        case CardType.DRAW_TWO:
-          // 下一个玩家摸2张
+          // UNO: in 2-player mode, Reverse acts like Skip.
+          if (this.players.length === 2) {
+            const nextIndex = this.getNextPlayerIndex();
+            this.players[nextIndex].isSkipped = true;
+            this.broadcast({
+              type: 'PLAYER_SKIPPED',
+              playerId: this.players[nextIndex].id
+            });
+          }
+          break;
+        }
+
+        case CardType.DRAW_TWO: {
           const nextPlayer = this.players[this.getNextPlayerIndex()];
           this.drawCardsForPlayer(nextPlayer, 2);
-          // +2: penalized player draws and loses their turn
           nextPlayer.isSkipped = true;
           this.broadcast({
             type: 'PLAYER_SKIPPED',
             playerId: nextPlayer.id
           });
           break;
+        }
 
-        case CardType.WILD_DRAW_FOUR:
-          // 所有其他玩家摸4张
+        case CardType.WILD: {
+          if (chosenColor) {
+            this.currentColor = chosenColor;
+            this.broadcast({
+              type: 'COLOR_CHANGED',
+              color: chosenColor
+            });
+          }
+          break;
+        }
+
+        case CardType.WILD_DRAW_FOUR: {
+          if (chosenColor) {
+            this.currentColor = chosenColor;
+            this.broadcast({
+              type: 'COLOR_CHANGED',
+              color: chosenColor
+            });
+          }
+
           const nextPlayerForDraw4 = this.players[this.getNextPlayerIndex()];
           this.drawCardsForPlayer(nextPlayerForDraw4, 4);
-          // +4: penalized player draws and loses their turn
           nextPlayerForDraw4.isSkipped = true;
           this.broadcast({
             type: 'PLAYER_SKIPPED',
             playerId: nextPlayerForDraw4.id
           });
           break;
+        }
       }
     }
   }
 
-  /**
-   * 查找潜在的吃碰杠动作
-   */
-  private findPotentialActions(card: Card, playedBy: Player): void {
+  private findPotentialActions(card: Card, playedBy: Player): boolean {
     this.pendingActions = [];
+    this.claimQueue = [];
+    this.claimQueueIndex = 0;
 
-    for (let i = 0; i < this.players.length; i++) {
-      const player = this.players[i];
+    const startIndex = this.getNextPlayerIndex();
+    const order: number[] = [];
+    for (let k = 0; k < this.players.length - 1; k++) {
+      const idx = (startIndex + k * this.turnDirection + this.players.length) % this.players.length;
+      order.push(idx);
+    }
+
+    const gangByPlayer = new Map<string, PotentialAction>();
+    const pengByPlayer = new Map<string, PotentialAction>();
+    const chiByPlayer = new Map<string, PotentialAction[]>();
+
+    for (const idx of order) {
+      const player = this.players[idx];
       if (player.id === playedBy.id) continue;
 
-      // 检查杠（3张相同）
-      const gangCards = player.hand.filter(c => cardsAreIdentical(c, card));
-      if (gangCards.length >= 3) {
-        this.pendingActions.push({
+      const identicalInHand = player.hand.filter(c => cardsAreIdentical(c, card));
+      if (identicalInHand.length >= 3) {
+        gangByPlayer.set(player.id, {
           type: 'GANG',
           playerId: player.id,
-          cards: gangCards.slice(0, 3),
+          cards: identicalInHand.slice(0, 3),
           targetCard: card
         });
+        continue;
       }
 
-      // 检查碰（2张相同）
-      const pengCards = player.hand.filter(c => cardsAreIdentical(c, card));
-      if (pengCards.length >= 2) {
-        this.pendingActions.push({
+      if (identicalInHand.length >= 2) {
+        pengByPlayer.set(player.id, {
           type: 'PENG',
           playerId: player.id,
-          cards: pengCards.slice(0, 2),
+          cards: identicalInHand.slice(0, 2),
+          targetCard: card
+        });
+      }
+    }
+
+    // CHI: only the next player can CHI (lowest priority).
+    const nextPlayer = this.players[startIndex];
+    if (nextPlayer && nextPlayer.id !== playedBy.id && card.type === CardType.NUMBER) {
+      const cardValue = parseInt(card.value);
+      const sameColorCards = nextPlayer.hand.filter(c => c.color === card.color && c.type === CardType.NUMBER);
+      const values = sameColorCards.map(c => parseInt(c.value));
+
+      const chiOptions: PotentialAction[] = [];
+
+      if (values.includes(cardValue - 1) && values.includes(cardValue - 2)) {
+        const chiCards = [
+          sameColorCards.find(c => parseInt(c.value) === cardValue - 2)!,
+          sameColorCards.find(c => parseInt(c.value) === cardValue - 1)!
+        ];
+        chiOptions.push({
+          type: 'CHI',
+          playerId: nextPlayer.id,
+          cards: chiCards,
           targetCard: card
         });
       }
 
-      // 检查吃（只能吃上家的数字牌，且必须同色）
-      const prevPlayerIndex = (this.currentPlayerIndex - 1 + this.players.length) % this.players.length;
-      if (i === this.getNextPlayerIndex() && 
-          playedBy.id === this.players[prevPlayerIndex].id &&
-          card.type === CardType.NUMBER) {
-        
-        const cardValue = parseInt(card.value);
-        const sameColorCards = player.hand.filter(c => 
-          c.color === card.color && c.type === CardType.NUMBER
-        );
-
-        // 检查能否组成顺子
-        const values = sameColorCards.map(c => parseInt(c.value));
-        
-        // 吃法1: card-1, card-2
-        if (values.includes(cardValue - 1) && values.includes(cardValue - 2)) {
-          const chiCards = [
-            sameColorCards.find(c => parseInt(c.value) === cardValue - 2)!,
-            sameColorCards.find(c => parseInt(c.value) === cardValue - 1)!
-          ];
-          this.pendingActions.push({
-            type: 'CHI',
-            playerId: player.id,
-            cards: chiCards,
-            targetCard: card
-          });
-        }
-
-        // 吃法2: card+1, card-1
-        if (values.includes(cardValue - 1) && values.includes(cardValue + 1)) {
-          const chiCards = [
-            sameColorCards.find(c => parseInt(c.value) === cardValue - 1)!,
-            sameColorCards.find(c => parseInt(c.value) === cardValue + 1)!
-          ];
-          this.pendingActions.push({
-            type: 'CHI',
-            playerId: player.id,
-            cards: chiCards,
-            targetCard: card
-          });
-        }
-
-        // 吃法3: card+1, card+2
-        if (values.includes(cardValue + 1) && values.includes(cardValue + 2)) {
-          const chiCards = [
-            sameColorCards.find(c => parseInt(c.value) === cardValue + 1)!,
-            sameColorCards.find(c => parseInt(c.value) === cardValue + 2)!
-          ];
-          this.pendingActions.push({
-            type: 'CHI',
-            playerId: player.id,
-            cards: chiCards,
-            targetCard: card
-          });
-        }
-      }
-    }
-
-    if (this.pendingActions.length > 0) {
-      // 通知相关玩家
-      for (const action of this.pendingActions) {
-        this.sendToPlayer(action.playerId, {
-          type: 'POTENTIAL_ACTION',
-          actions: [action.type],
-          targetCard: action.targetCard
+      if (values.includes(cardValue - 1) && values.includes(cardValue + 1)) {
+        const chiCards = [
+          sameColorCards.find(c => parseInt(c.value) === cardValue - 1)!,
+          sameColorCards.find(c => parseInt(c.value) === cardValue + 1)!
+        ];
+        chiOptions.push({
+          type: 'CHI',
+          playerId: nextPlayer.id,
+          cards: chiCards,
+          targetCard: card
         });
       }
 
-      // 设置5秒超时
-      this.actionTimeout = setTimeout(() => {
-        this.pendingActions = [];
-        this.nextTurn();
-      }, 5000);
-    } else {
-      this.nextTurn();
+      if (values.includes(cardValue + 1) && values.includes(cardValue + 2)) {
+        const chiCards = [
+          sameColorCards.find(c => parseInt(c.value) === cardValue + 1)!,
+          sameColorCards.find(c => parseInt(c.value) === cardValue + 2)!
+        ];
+        chiOptions.push({
+          type: 'CHI',
+          playerId: nextPlayer.id,
+          cards: chiCards,
+          targetCard: card
+        });
+      }
+
+      if (chiOptions.length > 0) {
+        chiByPlayer.set(nextPlayer.id, chiOptions);
+      }
     }
+
+    // Priority: GANG > PENG > CHI; within each, ask in turn order (next player, then next...).
+    for (const idx of order) {
+      const playerId = this.players[idx]?.id;
+      if (!playerId) continue;
+      const action = gangByPlayer.get(playerId);
+      if (!action) continue;
+      this.claimQueue.push({ playerId, actions: [action] });
+    }
+
+    for (const idx of order) {
+      const playerId = this.players[idx]?.id;
+      if (!playerId) continue;
+      if (gangByPlayer.has(playerId)) continue;
+      const action = pengByPlayer.get(playerId);
+      if (!action) continue;
+      this.claimQueue.push({ playerId, actions: [action] });
+    }
+
+    for (const idx of order) {
+      const playerId = this.players[idx]?.id;
+      if (!playerId) continue;
+      if (gangByPlayer.has(playerId) || pengByPlayer.has(playerId)) continue;
+      const actions = chiByPlayer.get(playerId);
+      if (!actions || actions.length === 0) continue;
+      this.claimQueue.push({ playerId, actions });
+    }
+
+    if (this.claimQueue.length === 0) {
+      return false;
+    }
+
+    this.promptNextClaimCandidate();
+    return true;
   }
 
-  /**
-   * 处理吃牌
-   */
   private handleChi(player: Player, cards: Card[]): void {
     const action = this.pendingActions.find(a => 
       a.playerId === player.id && a.type === 'CHI'
@@ -611,6 +865,22 @@ export class Game {
       this.actionTimeout = null;
     }
 
+    // Ensure the provided cards match one of the offered CHI candidates.
+    const chiCandidate = this.pendingActions.find(a =>
+      a.playerId === player.id &&
+      a.type === 'CHI' &&
+      a.cards.length === cards.length &&
+      a.cards.every(c => cards.some(x => x.id === c.id))
+    );
+    if (!chiCandidate) {
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '无法吃牌'
+      });
+      return;
+    }
+
     // 执行吃牌
     removeCardsFromHand(player, cards);
     const meldedSet = [...cards, action.targetCard];
@@ -622,11 +892,12 @@ export class Game {
       cards: meldedSet
     });
 
-    // 清空待处理动作
     this.pendingActions = [];
-
-    // 该玩家获得出牌权
-    this.currentPlayerIndex = this.players.findIndex(p => p.id === player.id);
+    this.pendingEffect = null;
+    this.claimQueue = [];
+    this.claimQueueIndex = 0;
+    this.removeCardFromDiscardPile(action.targetCard.id);
+    this.startNewRoundWithLeader(player.id);
     this.sendGameStateToAll();
   }
 
@@ -678,7 +949,11 @@ export class Game {
     }
 
     this.pendingActions = [];
-    this.currentPlayerIndex = this.players.findIndex(p => p.id === player.id);
+    this.pendingEffect = null;
+    this.claimQueue = [];
+    this.claimQueueIndex = 0;
+    this.removeCardFromDiscardPile(action.targetCard.id);
+    this.startNewRoundWithLeader(player.id);
     this.sendGameStateToAll();
   }
 
@@ -730,7 +1005,12 @@ export class Game {
     }
 
     this.pendingActions = [];
-    this.currentPlayerIndex = this.players.findIndex(p => p.id === player.id);
+    this.pendingEffect = null;
+    this.claimQueue = [];
+    this.claimQueueIndex = 0;
+    this.removeCardFromDiscardPile(action.targetCard.id);
+    this.drawCardsForPlayer(player, 1);
+    this.startNewRoundWithLeader(player.id);
     this.sendGameStateToAll();
   }
 
@@ -776,6 +1056,7 @@ export class Game {
       this.lastPlayedHand = [];
       this.lastPlayedHandType = null;
       this.hasActiveRound = false;
+      this.currentColor = null;
       this.passCount = 0;
 
       this.broadcast({
@@ -919,6 +1200,7 @@ export class Game {
           phase: this.gamePhase,
           currentPlayerId: this.players[this.currentPlayerIndex]?.id,
           turnDirection: this.turnDirection,
+          currentColor: this.currentColor,
           lastPlayedHand: this.lastPlayedHand,
           lastPlayedHandType: this.lastPlayedHandType,
           deckCount: this.deck.length,

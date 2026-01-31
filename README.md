@@ -86,7 +86,7 @@ pm2 stop umd-game       # 停止
 { type: 'START_GAME' }
 
 // 出牌
-{ type: 'PLAYER_ACTION', action: { type: 'PLAY_CARDS', cards: [...] } }
+{ type: 'PLAYER_ACTION', action: { type: 'PLAY_CARDS', cards: [...], selectedColor: 'RED' } } // wild/+4 需要 selectedColor: RED/YELLOW/BLUE/GREEN
 
 // 摸牌
 { type: 'PLAYER_ACTION', action: { type: 'DRAW_CARD' } }

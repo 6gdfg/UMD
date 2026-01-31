@@ -213,6 +213,7 @@ wss.on('connection', (ws: WebSocket) => {
     const action: PlayerAction = {
       type: message.action.type,
       cards: message.action.cards,
+      selectedColor: message.action.selectedColor,
       playerId: playerId
     };
 

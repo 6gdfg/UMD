@@ -221,11 +221,19 @@
                 alert('请先选择要出的牌');
                 return;
             }
+            const hasWild = selectedCards.some(c => c.type === 'wild' || c.type === 'wild_draw4');
+            let selectedColor = undefined;
+            if (hasWild) {
+                const input = prompt('万能牌请选择颜色：RED / YELLOW / BLUE / GREEN', 'RED');
+                if (!input) return;
+                selectedColor = input.trim().toUpperCase();
+            }
             ws.send(JSON.stringify({
                 type: 'PLAYER_ACTION',
                 action: {
                     type: 'PLAY_CARDS',
-                    cards: selectedCards
+                    cards: selectedCards,
+                    selectedColor: selectedColor
                 }
             }));
             selectedCards = [];
