@@ -549,6 +549,52 @@ export class Game {
       return this.compareBombs(playedCards, lastCards);
     }
 
+    const lastType = this.lastPlayedHandType;
+    if (!lastType) return true;
+
+    // UNO-style phase (single / pair / triple): allow switching into other hand types,
+    // as long as the played hand matches the current effective color (or is wild/bomb handled above).
+    if (lastType === HandType.SINGLE || lastType === HandType.PAIR || lastType === HandType.TRIPLE) {
+      const activeColor =
+        this.currentColor ?? (lastCards[0].color !== CardColor.WILD ? lastCards[0].color : null);
+
+      const allMatchActiveColor =
+        !!activeColor &&
+        playedCards.length > 0 &&
+        playedCards.every(c => c.color !== CardColor.WILD && c.color === activeColor);
+
+      switch (handType) {
+        case HandType.SINGLE:
+          return this.isValidSinglePlay(playedCards[0], lastCards[0]);
+        case HandType.PAIR:
+        case HandType.TRIPLE:
+          return this.compareGroups(playedCards, lastCards);
+        case HandType.FULL_HOUSE:
+        case HandType.STRAIGHT:
+        case HandType.CONSECUTIVE_PAIRS:
+        case HandType.AIRPLANE:
+          return allMatchActiveColor;
+        default:
+          return false;
+      }
+    }
+
+    // Combo rounds: must match the same hand type (bombs handled above).
+    if (lastType !== handType) {
+      return false;
+    }
+
+    switch (handType) {
+      case HandType.FULL_HOUSE:
+        return playedCards.length === lastCards.length;
+      case HandType.STRAIGHT:
+      case HandType.CONSECUTIVE_PAIRS:
+      case HandType.AIRPLANE:
+        return this.compareSequences(playedCards, lastCards);
+      default:
+        return false;
+    }
+
     // 牌型必须一致
     if (this.lastPlayedHandType !== handType) {
       return false;
