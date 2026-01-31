@@ -68,6 +68,15 @@ export class Game {
     this.deck = shuffleDeck(createDeck());
   }
 
+  private isClaimWindowActive(): boolean {
+    return !!this.pendingEffect && !!this.actionTimeout && this.claimQueue.length > 0;
+  }
+
+  private getCurrentClaimPlayerId(): string | null {
+    if (!this.isClaimWindowActive()) return null;
+    return this.claimQueue[this.claimQueueIndex]?.playerId ?? null;
+  }
+
   addPlayer(id: string, name: string, ws: WebSocket): boolean {
     if (this.gamePhase !== GamePhase.WAITING) return false;
     if (this.players.length >= 10) return false;
@@ -128,6 +137,21 @@ export class Game {
         message: '玩家不存在'
       });
       return;
+    }
+
+    // During the CHI/PENG/GANG claim window, only the currently prompted player may respond,
+    // and only with CHI/PENG/GANG. Everyone else must wait.
+    if (this.isClaimWindowActive()) {
+      const claimPlayerId = this.getCurrentClaimPlayerId();
+      const isClaimAction = action.type === 'CHI' || action.type === 'PENG' || action.type === 'GANG';
+      if (!claimPlayerId || action.playerId !== claimPlayerId || !isClaimAction) {
+        this.sendToPlayer(action.playerId, {
+          type: 'ACTION_VALIDATION',
+          isValid: false,
+          message: 'Waiting for CHI/PENG/GANG decision'
+        });
+        return;
+      }
     }
 
     switch (action.type) {
@@ -603,8 +627,20 @@ export class Game {
     return played.type === last.type;
   }
 
+  private isValidGroupPlay(played: Card, last: Card): boolean {
+    // Group hands (PAIR / TRIPLE): follow the active color only (plus wilds).
+    // This matches "state is YELLOW => must play YELLOW group".
+    if (played.type === CardType.WILD || played.type === CardType.WILD_DRAW_FOUR) {
+      return true;
+    }
+
+    const activeColor = this.currentColor ?? (last.color !== CardColor.WILD ? last.color : null);
+    if (!activeColor) return false;
+    return played.color === activeColor;
+  }
+
   private compareGroups(played: Card[], last: Card[]): boolean {
-    return this.isValidSinglePlay(played[0], last[0]);
+    return this.isValidGroupPlay(played[0], last[0]);
   }
 
   /**
@@ -1053,8 +1089,13 @@ export class Game {
       playerId: player.id
     });
 
-    // UNO-style single-card turns: draw 1 then immediately pass the turn; do NOT start a new round.
-    if (this.hasActiveRound && this.lastPlayedHandType === HandType.SINGLE) {
+    // UNO-style turns (SINGLE / PAIR / TRIPLE): draw 1 then immediately pass the turn; do NOT start a new round.
+    if (
+      this.hasActiveRound &&
+      (this.lastPlayedHandType === HandType.SINGLE ||
+        this.lastPlayedHandType === HandType.PAIR ||
+        this.lastPlayedHandType === HandType.TRIPLE)
+    ) {
       this.nextTurn();
       return;
     }
