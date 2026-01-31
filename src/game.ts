@@ -1040,35 +1040,35 @@ export class Game {
       return;
     }
 
-    // Pass时摸一张牌
+    if (player.isSkipped) {
+      player.isSkipped = false;
+      this.nextTurn();
+      return;
+    }
+
     this.drawCardsForPlayer(player, 1);
 
-    this.passCount++;
-    
     this.broadcast({
       type: 'PLAYER_PASSED',
       playerId: player.id
     });
 
-    // 如果所有其他玩家都pass了，上一个出牌的玩家获得主动权
-    if (this.passCount >= this.players.length - 1 && this.lastPlayedBy) {
-      this.currentPlayerIndex = this.players.findIndex(p => p.id === this.lastPlayedBy);
-      this.lastPlayedHand = [];
-      this.lastPlayedHandType = null;
-      this.hasActiveRound = false;
-      this.currentColor = null;
-      this.passCount = 0;
-
-      this.broadcast({
-        type: 'NEW_ROUND',
-        leadPlayerId: this.lastPlayedBy,
-        message: '所有人都pass，新一轮开始'
-      });
-
-      this.sendGameStateToAll();
-    } else {
+    // UNO-style single-card turns: draw 1 then immediately pass the turn; do NOT start a new round.
+    if (this.hasActiveRound && this.lastPlayedHandType === HandType.SINGLE) {
       this.nextTurn();
+      return;
     }
+
+    // Combo-round pass rule: if everyone else passed, the last player who played becomes the leader.
+    this.passCount++;
+    if (this.passCount >= this.players.length - 1 && this.lastPlayedBy) {
+      const leaderId = this.lastPlayedBy;
+      this.startNewRoundWithLeader(leaderId);
+      this.sendGameStateToAll();
+      return;
+    }
+
+    this.nextTurn();
   }
 
   /**
