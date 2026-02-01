@@ -1,20 +1,15 @@
-/**
- * WebSocket服务器入口
- * 处理客户端连接和房间管理
- */
-
 import WebSocket, { WebSocketServer } from 'ws';
-import { Game, PlayerAction } from './game';
 import { createServer } from 'http';
+import { Game, PlayerAction } from './game';
 
-// 房间管理
 const games = new Map<string, Game>();
-
-// 玩家到房间的映射
 const playerRooms = new Map<string, string>();
 
-// 创建HTTP服务器
-// Handle plain HTTP requests so a reverse proxy (e.g. nginx) doesn't wait forever.
+// Allow quick app/browser switch without "instant elimination".
+// If the player reconnects with the same playerId within this window, they keep the seat.
+const DISCONNECT_GRACE_MS = 10_000;
+const disconnectTimers = new Map<string, NodeJS.Timeout>();
+
 const server = createServer((req, res) => {
   if (req.url === '/healthz') {
     res.statusCode = 200;
@@ -28,185 +23,210 @@ const server = createServer((req, res) => {
   res.end('UMD game server is running. Use WebSocket on this host/port.');
 });
 
-// 创建WebSocket服务器
 const wss = new WebSocketServer({ server });
 
-console.log('UMD卡牌游戏服务器启动中...');
+function generateRoomId(): string {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
 
-/**
- * 处理WebSocket连接
- */
+function generatePlayerId(): string {
+  return `player_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
 wss.on('connection', (ws: WebSocket) => {
-  console.log('新客户端连接');
-
   let playerId: string | null = null;
   let playerName: string | null = null;
   let roomId: string | null = null;
 
-  // 处理客户端消息
   ws.on('message', (data: string) => {
     try {
       const message = JSON.parse(data.toString());
-      console.log('收到消息:', message);
 
       switch (message.type) {
-        case 'JOIN_ROOM':
-          handleJoinRoom(ws, message);
-          break;
-
         case 'CREATE_ROOM':
-          handleCreateRoom(ws, message);
+          handleCreateRoom(message);
           break;
-
+        case 'JOIN_ROOM':
+          handleJoinRoom(message);
+          break;
         case 'START_GAME':
-          handleStartGame(message);
+          handleStartGame();
           break;
-
         case 'PLAYER_ACTION':
           handlePlayerAction(message);
           break;
-
         case 'LEAVE_ROOM':
           handleLeaveRoom();
           break;
-
         default:
-          ws.send(JSON.stringify({
-            type: 'ERROR',
-            message: '未知的消息类型'
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'ERROR',
+              message: 'Unknown message type'
+            })
+          );
       }
     } catch (error) {
-      console.error('处理消息错误:', error);
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '消息格式错误'
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: 'Invalid message format'
+        })
+      );
     }
   });
 
-  // 处理断开连接
   ws.on('close', () => {
-    console.log('客户端断开连接');
-    handleLeaveRoom();
+    handleDisconnect(ws);
   });
 
-  // 处理错误
-  ws.on('error', (error) => {
-    console.error('WebSocket错误:', error);
+  ws.on('error', () => {
+    // close will handle cleanup
   });
 
-  /**
-   * 处理创建房间
-   */
-  function handleCreateRoom(ws: WebSocket, message: any) {
+  function handleCreateRoom(message: any) {
     const newRoomId = generateRoomId();
     const game = new Game(newRoomId);
     games.set(newRoomId, game);
 
-    playerId = message.playerId || generatePlayerId();
-    playerName = message.playerName || `玩家${playerId!.substring(0, 4)}`;
-    roomId = newRoomId;
+    const id: string = message.playerId || generatePlayerId();
+    const name: string = message.playerName || `Player_${id.substring(0, 4)}`;
+    const rid: string = newRoomId;
 
-    game.addPlayer(playerId!, playerName!, ws);
-    playerRooms.set(playerId!, roomId!);
+    playerId = id;
+    playerName = name;
+    roomId = rid;
 
-    ws.send(JSON.stringify({
-      type: 'ROOM_CREATED',
-      roomId: newRoomId,
-      playerId: playerId,
-      playerName: playerName
-    }));
+    game.addPlayer(id, name, ws);
+    playerRooms.set(id, rid);
 
-    console.log(`房间 ${newRoomId} 创建成功，玩家 ${playerName} 加入`);
+    ws.send(
+      JSON.stringify({
+        type: 'ROOM_CREATED',
+        roomId: rid,
+        playerId: id,
+        playerName: name
+      })
+    );
   }
 
-  /**
-   * 处理加入房间
-   */
-  function handleJoinRoom(ws: WebSocket, message: any) {
+  function handleJoinRoom(message: any) {
     const targetRoomId = message.roomId;
     const game = games.get(targetRoomId);
-
     if (!game) {
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '房间不存在'
-      }));
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Room not found' }));
       return;
     }
 
-    playerId = message.playerId || generatePlayerId();
-    playerName = message.playerName || `玩家${playerId!.substring(0, 4)}`;
+    const requestedPlayerId = message.playerId || generatePlayerId();
+    const requestedPlayerName =
+      message.playerName || `Player_${requestedPlayerId.substring(0, 4)}`;
+
+    // Reconnect: keep the seat if playerId already exists in this room.
+    const existing = game.players.find(p => p.id === requestedPlayerId);
+    if (existing) {
+      const timer = disconnectTimers.get(requestedPlayerId);
+      if (timer) clearTimeout(timer);
+      disconnectTimers.delete(requestedPlayerId);
+
+      const oldWs = game.getPlayerWs(requestedPlayerId);
+      if (oldWs && oldWs !== ws) {
+        try {
+          oldWs.close(4000, 'replaced by reconnect');
+        } catch {}
+      }
+
+      game.reconnectPlayer(requestedPlayerId, ws);
+
+      playerId = requestedPlayerId;
+      playerName = existing.name;
+      roomId = targetRoomId;
+      playerRooms.set(requestedPlayerId, targetRoomId);
+
+      ws.send(
+        JSON.stringify({
+          type: 'ROOM_JOINED',
+          roomId: targetRoomId,
+          playerId: requestedPlayerId,
+          playerName: existing.name,
+          reconnected: true
+        })
+      );
+      return;
+    }
+
+    // Normal join (only allowed while waiting).
+    playerId = requestedPlayerId;
+    playerName = requestedPlayerName;
     roomId = targetRoomId;
 
-    const success = game.addPlayer(playerId!, playerName!, ws);
-
-    if (success) {
-      playerRooms.set(playerId!, roomId!);
-      ws.send(JSON.stringify({
-        type: 'ROOM_JOINED',
-        roomId: roomId,
-        playerId: playerId,
-        playerName: playerName
-      }));
-      console.log(`玩家 ${playerName} 加入房间 ${roomId}`);
-    } else {
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '无法加入房间（房间已满或游戏已开始）'
-      }));
+    const success = game.addPlayer(requestedPlayerId, requestedPlayerName, ws);
+    if (!success) {
+      ws.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: 'Unable to join room (full or already started)'
+        })
+      );
+      return;
     }
+
+    playerRooms.set(requestedPlayerId, targetRoomId);
+    ws.send(
+      JSON.stringify({
+        type: 'ROOM_JOINED',
+        roomId: targetRoomId,
+        playerId: requestedPlayerId,
+        playerName: requestedPlayerName,
+        reconnected: false
+      })
+    );
   }
 
-  /**
-   * 处理开始游戏
-   */
-  function handleStartGame(message: any) {
+  function handleStartGame() {
     if (!roomId) {
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '你不在任何房间中'
-      }));
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Not in a room' }));
       return;
     }
 
     const game = games.get(roomId);
     if (!game) {
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '房间不存在'
-      }));
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Room not found' }));
       return;
     }
 
     const success = game.startGame();
     if (!success) {
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '无法开始游戏（玩家人数不足或游戏已开始）'
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: 'Unable to start game'
+        })
+      );
     }
   }
 
-  /**
-   * 处理玩家动作
-   */
   function handlePlayerAction(message: any) {
     if (!roomId || !playerId) {
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '你不在任何房间中'
-      }));
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Not in a room' }));
       return;
     }
 
     const game = games.get(roomId);
     if (!game) {
-      ws.send(JSON.stringify({
-        type: 'ERROR',
-        message: '房间不存在'
-      }));
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Room not found' }));
+      return;
+    }
+
+    // Ignore actions from stale sockets (e.g. after reconnect).
+    const currentWs = game.getPlayerWs(playerId);
+    if (currentWs && currentWs !== ws) {
+      ws.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: 'This connection is no longer active for the player'
+        })
+      );
       return;
     }
 
@@ -214,68 +234,67 @@ wss.on('connection', (ws: WebSocket) => {
       type: message.action.type,
       cards: message.action.cards,
       selectedColor: message.action.selectedColor,
-      playerId: playerId
+      playerId
     };
 
     game.handlePlayerAction(action);
   }
 
-  /**
-   * 处理离开房间
-   */
   function handleLeaveRoom() {
-    if (playerId && roomId) {
-      const game = games.get(roomId);
-      if (game) {
-        game.removePlayer(playerId);
-        
-        // 如果房间没人了，删除房间
-        if (game.players.length === 0) {
-          games.delete(roomId);
-          console.log(`房间 ${roomId} 已删除（无玩家）`);
+    if (!playerId || !roomId) return;
+
+    const timer = disconnectTimers.get(playerId);
+    if (timer) clearTimeout(timer);
+    disconnectTimers.delete(playerId);
+
+    const game = games.get(roomId);
+    if (game) {
+      game.removePlayer(playerId);
+      if (game.players.length === 0) {
+        games.delete(roomId);
+      }
+    }
+
+    playerRooms.delete(playerId);
+    try {
+      ws.close();
+    } catch {}
+  }
+
+  function handleDisconnect(closedWs: WebSocket) {
+    if (!playerId || !roomId) return;
+    const game = games.get(roomId);
+    if (!game) return;
+
+    // If the player's socket has already been replaced (reconnect), ignore this close.
+    const currentWs = game.getPlayerWs(playerId);
+    if (currentWs && currentWs !== closedWs) return;
+
+    game.disconnectPlayer(playerId);
+
+    const existingTimer = disconnectTimers.get(playerId);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    const pid = playerId;
+    const rid = roomId;
+    const timer = setTimeout(() => {
+      const actualRoomId = playerRooms.get(pid) || rid;
+      const g = games.get(actualRoomId);
+      if (g) {
+        g.removePlayer(pid);
+        if (g.players.length === 0) {
+          games.delete(actualRoomId);
         }
       }
-      playerRooms.delete(playerId);
-      console.log(`玩家 ${playerName} 离开房间 ${roomId}`);
-    }
+      playerRooms.delete(pid);
+      disconnectTimers.delete(pid);
+    }, DISCONNECT_GRACE_MS);
+
+    disconnectTimers.set(playerId, timer);
   }
 });
 
-/**
- * 生成随机房间ID
- */
-function generateRoomId(): string {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
-
-/**
- * 生成随机玩家ID
- */
-function generatePlayerId(): string {
-  return `player_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-}
-
-// 启动服务器
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`✅ UMD卡牌游戏服务器运行在端口 ${PORT}`);
-  console.log(`WebSocket地址: ws://localhost:${PORT}`);
-  console.log('等待玩家连接...\n');
-});
-
-// 优雅关闭
-process.on('SIGTERM', () => {
-  console.log('收到SIGTERM信号，正在关闭服务器...');
-  server.close(() => {
-    console.log('服务器已关闭');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('\n收到SIGINT信号，正在关闭服务器...');
-  server.close(() => {
-    console.log('服务器已关闭');
-    process.exit(0);
-  });
+  console.log(`UMD game server listening on ${PORT}`);
 });

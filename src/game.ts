@@ -54,6 +54,8 @@ export class Game {
   lastPlayedHandType: HandType | null = null;
   lastPlayedBy: string | null = null;
   currentColor: CardColor | null = null;
+  pendingDrawCount: number = 0;
+  pendingDrawType: CardType.DRAW_TWO | CardType.WILD_DRAW_FOUR | null = null;
   pendingEffect: { card: Card; playedById: string; chosenColor: CardColor | null } | null = null;
   pendingActions: PotentialAction[] = [];
   actionTimeout: NodeJS.Timeout | null = null;
@@ -66,6 +68,42 @@ export class Game {
   constructor(roomId: string) {
     this.roomId = roomId;
     this.deck = shuffleDeck(createDeck());
+  }
+
+  private getPlayerById(playerId: string): Player | undefined {
+    return this.players.find(p => p.id === playerId);
+  }
+
+  getPlayerWs(playerId: string): WebSocket | null {
+    return this.getPlayerById(playerId)?.ws ?? null;
+  }
+
+  disconnectPlayer(playerId: string): boolean {
+    const player = this.getPlayerById(playerId);
+    if (!player) return false;
+    if (!player.isConnected) return true;
+
+    player.isConnected = false;
+    this.broadcast({
+      type: 'PLAYER_DISCONNECTED',
+      playerId
+    });
+    this.sendGameStateToAll();
+    return true;
+  }
+
+  reconnectPlayer(playerId: string, ws: WebSocket): boolean {
+    const player = this.getPlayerById(playerId);
+    if (!player) return false;
+
+    player.ws = ws;
+    player.isConnected = true;
+    this.broadcast({
+      type: 'PLAYER_RECONNECTED',
+      playerId
+    });
+    this.sendGameStateToAll();
+    return true;
   }
 
   private isClaimWindowActive(): boolean {
@@ -97,12 +135,40 @@ export class Game {
   removePlayer(playerId: string): void {
     const index = this.players.findIndex(p => p.id === playerId);
     if (index !== -1) {
+      const wasCurrent = index === this.currentPlayerIndex;
       this.players.splice(index, 1);
+
+      if (this.currentPlayerIndex > index) {
+        this.currentPlayerIndex--;
+      }
+      if (this.currentPlayerIndex >= this.players.length) {
+        this.currentPlayerIndex = 0;
+      }
+
       this.broadcast({
         type: 'PLAYER_LEFT',
         playerId,
         playerCount: this.players.length
       });
+
+      if (this.gamePhase === GamePhase.PLAYING) {
+        if (this.players.length === 1) {
+          this.endGame(this.players[0].id);
+          return;
+        }
+        if (this.players.length === 0) {
+          this.gamePhase = GamePhase.ENDED;
+          return;
+        }
+
+        if (wasCurrent) {
+          this.broadcast({
+            type: 'TURN_CHANGED',
+            currentPlayerId: this.players[this.currentPlayerIndex]?.id
+          });
+        }
+        this.sendGameStateToAll();
+      }
     }
   }
 
@@ -229,8 +295,30 @@ export class Game {
       });
       return;
     }
+    // +2/+4 stacking: if there is a pending draw penalty, the current player must respond with +2/+4 or a bomb,
+    // otherwise they must accept the penalty via PASS/DRAW_CARD.
+    if (this.pendingDrawCount > 0) {
+      const isBomb = handType === HandType.BOMB;
+      const isDrawResponse =
+        handType === HandType.SINGLE &&
+        cards.length === 1 &&
+        (this.pendingDrawType === CardType.WILD_DRAW_FOUR
+          ? cards[0].type === CardType.WILD_DRAW_FOUR
+          : cards[0].type === CardType.DRAW_TWO || cards[0].type === CardType.WILD_DRAW_FOUR);
 
-    if (!this.isValidPlay(cards, this.lastPlayedHand, handType)) {
+      if (!isBomb && !isDrawResponse) {
+        const allowText =
+          this.pendingDrawType === CardType.WILD_DRAW_FOUR ? '+4' : '+2/+4';
+        this.sendToPlayer(player.id, {
+          type: 'ACTION_VALIDATION',
+          isValid: false,
+          message: `链有加牌惩罚：可接${allowText}或出炸弹，或PASS接受罚牌`
+        });
+        return;
+      }
+    }
+
+    if (this.pendingDrawCount === 0 && !this.isValidPlay(cards, this.lastPlayedHand, handType)) {
       this.sendToPlayer(player.id, {
         type: 'ACTION_VALIDATION',
         isValid: false,
@@ -246,6 +334,12 @@ export class Game {
     this.discardPile.push(cards);
     this.hasActiveRound = true;
     this.passCount = 0;
+
+    if (this.pendingDrawCount > 0 && handType === HandType.BOMB) {
+      // Bomb overrides the pending draw chain.
+      this.pendingDrawCount = 0;
+      this.pendingDrawType = null;
+    }
 
     if (handType !== HandType.SINGLE) {
       if (
@@ -354,6 +448,24 @@ export class Game {
     this.nextTurn();
   }
 
+  private playerCanRespondToPendingDraw(player: Player): boolean {
+    if (this.pendingDrawType === CardType.WILD_DRAW_FOUR) {
+      if (player.hand.some(c => c.type === CardType.WILD_DRAW_FOUR)) return true;
+    } else {
+      if (player.hand.some(c => c.type === CardType.DRAW_TWO || c.type === CardType.WILD_DRAW_FOUR)) return true;
+    }
+
+    // Bomb response: 4+ identical cards (same color/type/value).
+    const counts = new Map<string, number>();
+    for (const c of player.hand) {
+      const key = `${c.color}|${c.type}|${c.value}`;
+      const next = (counts.get(key) || 0) + 1;
+      if (next >= 4) return true;
+      counts.set(key, next);
+    }
+    return false;
+  }
+
   private promptNextClaimCandidate(): void {
     if (this.actionTimeout) {
       clearTimeout(this.actionTimeout);
@@ -408,6 +520,8 @@ export class Game {
     this.lastPlayedHandType = null;
     this.lastPlayedBy = null;
     this.currentColor = null;
+    this.pendingDrawCount = 0;
+    this.pendingDrawType = null;
     this.pendingEffect = null;
 
     const leaderIndex = this.players.findIndex(p => p.id === leaderId);
@@ -436,8 +550,13 @@ export class Game {
     const allSame = cards.every(c => cardsAreIdentical(c, cards[0]));
     
     if (allSame) {
-      if (cards.length === 2) return HandType.PAIR;
-      if (cards.length === 3) return HandType.TRIPLE;
+      // Disallow forming pairs/triples with special UNO cards (+2/+4/skip/reverse/wild).
+      // They must be played as SINGLE (UNO style). Bombs (4+) are still allowed.
+      if (cards.length === 2 || cards.length === 3) {
+        if (cards[0].type !== CardType.NUMBER) return null;
+        if (cards.length === 2) return HandType.PAIR;
+        return HandType.TRIPLE;
+      }
       if (cards.length >= 4) return HandType.BOMB;
     }
 
@@ -746,12 +865,12 @@ export class Game {
         }
 
         case CardType.DRAW_TWO: {
-          const nextPlayer = this.players[this.getNextPlayerIndex()];
-          this.drawCardsForPlayer(nextPlayer, 2);
-          nextPlayer.isSkipped = true;
+          // UNO stacking: accumulate the draw penalty; the next player may respond with +2/+4 or a bomb.
+          this.pendingDrawCount += 2;
+          this.pendingDrawType = CardType.DRAW_TWO;
           this.broadcast({
-            type: 'PLAYER_SKIPPED',
-            playerId: nextPlayer.id
+            type: 'PENDING_DRAW_UPDATED',
+            count: this.pendingDrawCount
           });
           break;
         }
@@ -775,13 +894,12 @@ export class Game {
               color: chosenColor
             });
           }
-
-          const nextPlayerForDraw4 = this.players[this.getNextPlayerIndex()];
-          this.drawCardsForPlayer(nextPlayerForDraw4, 4);
-          nextPlayerForDraw4.isSkipped = true;
+          // UNO stacking: accumulate the draw penalty; the next player may respond with +2/+4 or a bomb.
+          this.pendingDrawCount += 4;
+          this.pendingDrawType = CardType.WILD_DRAW_FOUR;
           this.broadcast({
-            type: 'PLAYER_SKIPPED',
-            playerId: nextPlayerForDraw4.id
+            type: 'PENDING_DRAW_UPDATED',
+            count: this.pendingDrawCount
           });
           break;
         }
@@ -1109,6 +1227,21 @@ export class Game {
       return;
     }
 
+    // If there is a pending +2/+4 chain, DRAW_CARD means "accept the penalty".
+    if (this.pendingDrawCount > 0) {
+      const count = this.pendingDrawCount;
+      this.pendingDrawCount = 0;
+      this.pendingDrawType = null;
+      this.drawCardsForPlayer(player, count);
+      this.broadcast({
+        type: 'DRAW_PENALTY_ACCEPTED',
+        playerId: player.id,
+        count
+      });
+      this.nextTurn();
+      return;
+    }
+
     this.drawCardsForPlayer(player, 1);
     this.nextTurn();
   }
@@ -1124,6 +1257,25 @@ export class Game {
 
     if (player.isSkipped) {
       player.isSkipped = false;
+      this.nextTurn();
+      return;
+    }
+
+    // If there is a pending +2/+4 chain, PASS means "accept the penalty".
+    if (this.pendingDrawCount > 0) {
+      const count = this.pendingDrawCount;
+      this.pendingDrawCount = 0;
+      this.pendingDrawType = null;
+      this.drawCardsForPlayer(player, count);
+      this.broadcast({
+        type: 'DRAW_PENALTY_ACCEPTED',
+        playerId: player.id,
+        count
+      });
+      this.broadcast({
+        type: 'PLAYER_PASSED',
+        playerId: player.id
+      });
       this.nextTurn();
       return;
     }
@@ -1213,18 +1365,55 @@ export class Game {
    */
   private nextTurn(): void {
     // Move to the next player, automatically consuming any "skip" flags.
+    // If there is a pending +2/+4 chain, auto-resolve it for players who cannot respond.
     if (this.players.length === 0) return;
 
-    let nextIndex = this.getNextPlayerIndex();
-    for (let i = 0; i < this.players.length; i++) {
-      const candidate = this.players[nextIndex];
-      if (!candidate.isSkipped) break;
-      candidate.isSkipped = false;
-      nextIndex = (nextIndex + this.turnDirection + this.players.length) % this.players.length;
+    for (let safety = 0; safety < this.players.length + 2; safety++) {
+      let nextIndex = this.getNextPlayerIndex();
+      for (let i = 0; i < this.players.length; i++) {
+        const candidate = this.players[nextIndex];
+        if (!candidate.isSkipped) break;
+        candidate.isSkipped = false;
+        nextIndex = (nextIndex + this.turnDirection + this.players.length) % this.players.length;
+      }
+
+      this.currentPlayerIndex = nextIndex;
+
+      if (this.pendingDrawCount > 0) {
+        const current = this.players[this.currentPlayerIndex];
+        const canRespond = this.playerCanRespondToPendingDraw(current);
+        if (!canRespond) {
+          const count = this.pendingDrawCount;
+          this.pendingDrawCount = 0;
+          this.pendingDrawType = null;
+          this.drawCardsForPlayer(current, count);
+          this.broadcast({
+            type: 'DRAW_PENALTY_FORCED',
+            playerId: current.id,
+            count
+          });
+          // Current player loses the turn after taking the penalty; advance again.
+          continue;
+        }
+
+        const allowedCardTypes =
+          this.pendingDrawType === CardType.WILD_DRAW_FOUR
+            ? [CardType.WILD_DRAW_FOUR, 'BOMB']
+            : [CardType.DRAW_TWO, CardType.WILD_DRAW_FOUR, 'BOMB'];
+
+        const allowText = this.pendingDrawType === CardType.WILD_DRAW_FOUR ? '+4' : '+2/+4';
+        this.sendToPlayer(current.id, {
+          type: 'PENDING_DRAW',
+          count: this.pendingDrawCount,
+          pendingDrawType: this.pendingDrawType,
+          allowedCardTypes,
+          message: `You may respond with ${allowText} or a bomb, or PASS to accept the penalty`
+        });
+      }
+
+      break;
     }
 
-    this.currentPlayerIndex = nextIndex;
-    
     this.broadcast({
       type: 'TURN_CHANGED',
       currentPlayerId: this.players[this.currentPlayerIndex].id
@@ -1290,6 +1479,8 @@ export class Game {
           currentColor: this.currentColor,
           lastPlayedHand: this.lastPlayedHand,
           lastPlayedHandType: this.lastPlayedHandType,
+          pendingDrawCount: this.pendingDrawCount,
+          pendingDrawType: this.pendingDrawType,
           deckCount: this.deck.length,
           players: this.players.map(p => 
             p.id === player.id ? getPlayerPrivateInfo(p) : getPlayerPublicInfo(p)
