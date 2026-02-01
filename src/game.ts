@@ -6,6 +6,7 @@
 import { Card, CardType, CardColor, createDeck, shuffleDeck, cardsAreIdentical, getCardPower } from './card';
 import { Player, createPlayer, dealCards, removeCardsFromHand, hasCards, getPlayerPublicInfo, getPlayerPrivateInfo } from './player';
 import WebSocket from 'ws';
+import { logger } from './logger';
 
 export enum GamePhase {
   WAITING = 'waiting',
@@ -84,6 +85,7 @@ export class Game {
     if (!player.isConnected) return true;
 
     player.isConnected = false;
+    logger.info('player_disconnected', { roomId: this.roomId, playerId });
     this.broadcast({
       type: 'PLAYER_DISCONNECTED',
       playerId
@@ -98,6 +100,7 @@ export class Game {
 
     player.ws = ws;
     player.isConnected = true;
+    logger.info('player_reconnected', { roomId: this.roomId, playerId });
     this.broadcast({
       type: 'PLAYER_RECONNECTED',
       playerId
@@ -122,6 +125,8 @@ export class Game {
 
     const player = createPlayer(id, name, ws);
     this.players.push(player);
+
+    logger.info('player_joined_room', { roomId: this.roomId, playerId: id, playerName: name });
     
     this.broadcast({
       type: 'PLAYER_JOINED',
@@ -137,6 +142,8 @@ export class Game {
     if (index !== -1) {
       const wasCurrent = index === this.currentPlayerIndex;
       this.players.splice(index, 1);
+
+      logger.info('player_left_room', { roomId: this.roomId, playerId });
 
       if (this.currentPlayerIndex > index) {
         this.currentPlayerIndex--;
@@ -183,6 +190,8 @@ export class Game {
 
     this.currentPlayerIndex = Math.floor(Math.random() * this.players.length);
     this.gamePhase = GamePhase.PLAYING;
+
+    logger.info('game_started', { roomId: this.roomId, playerCount: this.players.length });
     this.hasActiveRound = false;
 
     this.broadcast({
@@ -195,6 +204,12 @@ export class Game {
   }
 
   handlePlayerAction(action: PlayerAction): void {
+    logger.info('player_action', {
+      roomId: this.roomId,
+      playerId: action.playerId,
+      type: action.type,
+      cardCount: action.cards?.length ?? 0
+    });
     const player = this.players.find(p => p.id === action.playerId);
     if (!player) {
       this.sendToPlayer(action.playerId, {
@@ -285,19 +300,29 @@ export class Game {
       return;
     }
 
-    const chosenColor = this.parseSelectedColor(selectedColor);
-    const hasWild = cards.some(c => c.type === CardType.WILD || c.type === CardType.WILD_DRAW_FOUR);
-    if (hasWild && !chosenColor) {
+      const chosenColor = this.parseSelectedColor(selectedColor);
+      const hasWild = cards.some(c => c.type === CardType.WILD || c.type === CardType.WILD_DRAW_FOUR);
+      if (hasWild && !chosenColor) {
       this.sendToPlayer(player.id, {
         type: 'ACTION_VALIDATION',
         isValid: false,
         message: '出万能牌时必须选择变色后的颜色'
       });
-      return;
-    }
-    // +2/+4 stacking: if there is a pending draw penalty, the current player must respond with +2/+4 or a bomb,
-    // otherwise they must accept the penalty via PASS/DRAW_CARD.
-    if (this.pendingDrawCount > 0) {
+        return;
+      }
+
+      logger.info('cards_played', {
+        roomId: this.roomId,
+        playerId: player.id,
+        handType,
+        cards: cards.map(c => ({ color: c.color, type: c.type, value: c.value })),
+        chosenColor: chosenColor ?? null,
+        pendingDrawCountBefore: this.pendingDrawCount,
+        pendingDrawTypeBefore: this.pendingDrawType
+      });
+      // +2/+4 stacking: if there is a pending draw penalty, the current player must respond with +2/+4 or a bomb,
+      // otherwise they must accept the penalty via PASS/DRAW_CARD.
+      if (this.pendingDrawCount > 0) {
       const isBomb = handType === HandType.BOMB;
       const isDrawResponse =
         handType === HandType.SINGLE &&
@@ -363,10 +388,11 @@ export class Game {
       chosenColor: chosenColor
     });
 
-    if (player.hand.length === 0) {
-      this.endGame(player.id);
-      return;
-    }
+      if (player.hand.length === 0) {
+        logger.info('player_won', { roomId: this.roomId, playerId: player.id });
+        this.endGame(player.id);
+        return;
+      }
 
     if (player.hand.length === 1 && !player.hasCalledUno) {
       setTimeout(() => {
@@ -842,6 +868,11 @@ export class Game {
             type: 'PLAYER_SKIPPED',
             playerId: this.players[nextIndex].id
           });
+          logger.info('effect_skip', {
+            roomId: this.roomId,
+            by: player.id,
+            target: this.players[nextIndex].id
+          });
           break;
         }
 
@@ -851,6 +882,11 @@ export class Game {
             type: 'DIRECTION_REVERSED',
             newDirection: this.turnDirection
           });
+          logger.info('effect_reverse', {
+            roomId: this.roomId,
+            by: player.id,
+            direction: this.turnDirection
+          });
 
           // UNO: in 2-player mode, Reverse acts like Skip.
           if (this.players.length === 2) {
@@ -859,6 +895,11 @@ export class Game {
             this.broadcast({
               type: 'PLAYER_SKIPPED',
               playerId: this.players[nextIndex].id
+            });
+            logger.info('effect_reverse_as_skip_2p', {
+              roomId: this.roomId,
+              by: player.id,
+              target: this.players[nextIndex].id
             });
           }
           break;
@@ -872,6 +913,12 @@ export class Game {
             type: 'PENDING_DRAW_UPDATED',
             count: this.pendingDrawCount
           });
+          logger.info('effect_draw2_pending', {
+            roomId: this.roomId,
+            by: player.id,
+            pendingDrawCount: this.pendingDrawCount,
+            pendingDrawType: this.pendingDrawType
+          });
           break;
         }
 
@@ -882,6 +929,7 @@ export class Game {
               type: 'COLOR_CHANGED',
               color: chosenColor
             });
+            logger.info('effect_wild_color', { roomId: this.roomId, by: player.id, color: chosenColor });
           }
           break;
         }
@@ -893,6 +941,7 @@ export class Game {
               type: 'COLOR_CHANGED',
               color: chosenColor
             });
+            logger.info('effect_wild_draw4_color', { roomId: this.roomId, by: player.id, color: chosenColor });
           }
           // UNO stacking: accumulate the draw penalty; the next player may respond with +2/+4 or a bomb.
           this.pendingDrawCount += 4;
@@ -900,6 +949,12 @@ export class Game {
           this.broadcast({
             type: 'PENDING_DRAW_UPDATED',
             count: this.pendingDrawCount
+          });
+          logger.info('effect_draw4_pending', {
+            roomId: this.roomId,
+            by: player.id,
+            pendingDrawCount: this.pendingDrawCount,
+            pendingDrawType: this.pendingDrawType
           });
           break;
         }
@@ -1086,11 +1141,17 @@ export class Game {
     const meldedSet = [...cards, action.targetCard];
     player.meldedCards.push(meldedSet);
 
-    this.broadcast({
-      type: 'CHI_PERFORMED',
-      playerId: player.id,
-      cards: meldedSet
-    });
+      this.broadcast({
+        type: 'CHI_PERFORMED',
+        playerId: player.id,
+        cards: meldedSet
+      });
+      logger.info('chi_performed', {
+        roomId: this.roomId,
+        playerId: player.id,
+        target: { color: action.targetCard.color, type: action.targetCard.type, value: action.targetCard.value },
+        meld: meldedSet.map(c => ({ color: c.color, type: c.type, value: c.value }))
+      });
 
     this.pendingActions = [];
     this.pendingEffect = null;
@@ -1127,11 +1188,16 @@ export class Game {
     const meldedSet = [...action.cards, action.targetCard];
     player.meldedCards.push(meldedSet);
 
-    this.broadcast({
-      type: 'PENG_PERFORMED',
-      playerId: player.id,
-      cards: meldedSet
-    });
+      this.broadcast({
+        type: 'PENG_PERFORMED',
+        playerId: player.id,
+        cards: meldedSet
+      });
+      logger.info('peng_performed', {
+        roomId: this.roomId,
+        playerId: player.id,
+        target: { color: action.targetCard.color, type: action.targetCard.type, value: action.targetCard.value }
+      });
 
     // 处理+2或+4的碰
     if (action.targetCard.type === CardType.DRAW_TWO) {
@@ -1183,11 +1249,16 @@ export class Game {
     const meldedSet = [...action.cards, action.targetCard];
     player.meldedCards.push(meldedSet);
 
-    this.broadcast({
-      type: 'GANG_PERFORMED',
-      playerId: player.id,
-      cards: meldedSet
-    });
+      this.broadcast({
+        type: 'GANG_PERFORMED',
+        playerId: player.id,
+        cards: meldedSet
+      });
+      logger.info('gang_performed', {
+        roomId: this.roomId,
+        playerId: player.id,
+        target: { color: action.targetCard.color, type: action.targetCard.type, value: action.targetCard.value }
+      });
 
     // 处理+2或+4的杠
     if (action.targetCard.type === CardType.DRAW_TWO) {
@@ -1227,24 +1298,26 @@ export class Game {
       return;
     }
 
-    // If there is a pending +2/+4 chain, DRAW_CARD means "accept the penalty".
-    if (this.pendingDrawCount > 0) {
-      const count = this.pendingDrawCount;
-      this.pendingDrawCount = 0;
-      this.pendingDrawType = null;
-      this.drawCardsForPlayer(player, count);
-      this.broadcast({
-        type: 'DRAW_PENALTY_ACCEPTED',
-        playerId: player.id,
+      // If there is a pending +2/+4 chain, DRAW_CARD means "accept the penalty".
+      if (this.pendingDrawCount > 0) {
+        const count = this.pendingDrawCount;
+        this.pendingDrawCount = 0;
+        this.pendingDrawType = null;
+        logger.info('draw_penalty_accepted', { roomId: this.roomId, playerId: player.id, count });
+        this.drawCardsForPlayer(player, count);
+        this.broadcast({
+          type: 'DRAW_PENALTY_ACCEPTED',
+          playerId: player.id,
         count
       });
       this.nextTurn();
       return;
-    }
+      }
 
-    this.drawCardsForPlayer(player, 1);
-    this.nextTurn();
-  }
+      logger.info('draw_card', { roomId: this.roomId, playerId: player.id, count: 1 });
+      this.drawCardsForPlayer(player, 1);
+      this.nextTurn();
+    }
 
   /**
    * 处理Pass
@@ -1261,15 +1334,16 @@ export class Game {
       return;
     }
 
-    // If there is a pending +2/+4 chain, PASS means "accept the penalty".
-    if (this.pendingDrawCount > 0) {
-      const count = this.pendingDrawCount;
-      this.pendingDrawCount = 0;
-      this.pendingDrawType = null;
-      this.drawCardsForPlayer(player, count);
-      this.broadcast({
-        type: 'DRAW_PENALTY_ACCEPTED',
-        playerId: player.id,
+      // If there is a pending +2/+4 chain, PASS means "accept the penalty".
+      if (this.pendingDrawCount > 0) {
+        const count = this.pendingDrawCount;
+        this.pendingDrawCount = 0;
+        this.pendingDrawType = null;
+        logger.info('draw_penalty_accepted', { roomId: this.roomId, playerId: player.id, count });
+        this.drawCardsForPlayer(player, count);
+        this.broadcast({
+          type: 'DRAW_PENALTY_ACCEPTED',
+          playerId: player.id,
         count
       });
       this.broadcast({
@@ -1278,9 +1352,10 @@ export class Game {
       });
       this.nextTurn();
       return;
-    }
+      }
 
-    this.drawCardsForPlayer(player, 1);
+      logger.info('pass', { roomId: this.roomId, playerId: player.id });
+      this.drawCardsForPlayer(player, 1);
 
     this.broadcast({
       type: 'PLAYER_PASSED',

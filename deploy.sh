@@ -36,7 +36,14 @@ pm2 delete umd-game 2>/dev/null || true
 
 # 启动新进程
 echo "▶️  启动服务器..."
-pm2 start dist/index.js --name umd-game
+LOG_LEVEL=${LOG_LEVEL:-info} pm2 start dist/index.js --name umd-game --time
+
+# Rotate PM2 logs to prevent unbounded growth
+pm2 install pm2-logrotate 2>/dev/null || true
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 7
+pm2 set pm2-logrotate:compress true
+pm2 set pm2-logrotate:dateFormat YYYY-MM-DD_HH-mm-ss
 
 # 保存PM2配置
 pm2 save

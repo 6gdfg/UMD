@@ -1,6 +1,7 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { Game, PlayerAction } from './game';
+import { logger } from './logger';
 
 const games = new Map<string, Game>();
 const playerRooms = new Map<string, string>();
@@ -34,6 +35,7 @@ function generatePlayerId(): string {
 }
 
 wss.on('connection', (ws: WebSocket) => {
+  logger.info('ws_connected');
   let playerId: string | null = null;
   let playerName: string | null = null;
   let roomId: string | null = null;
@@ -41,6 +43,7 @@ wss.on('connection', (ws: WebSocket) => {
   ws.on('message', (data: string) => {
     try {
       const message = JSON.parse(data.toString());
+      logger.debug('ws_message', { type: message?.type, playerId, roomId });
 
       switch (message.type) {
         case 'CREATE_ROOM':
@@ -77,11 +80,13 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   ws.on('close', () => {
+    logger.info('ws_closed', { playerId, roomId });
     handleDisconnect(ws);
   });
 
   ws.on('error', () => {
     // close will handle cleanup
+    logger.warn('ws_error', { playerId, roomId });
   });
 
   function handleCreateRoom(message: any) {
@@ -100,6 +105,7 @@ wss.on('connection', (ws: WebSocket) => {
     game.addPlayer(id, name, ws);
     playerRooms.set(id, rid);
 
+    logger.info('room_created', { roomId: rid, playerId: id, playerName: name });
     ws.send(
       JSON.stringify({
         type: 'ROOM_CREATED',
@@ -143,17 +149,25 @@ wss.on('connection', (ws: WebSocket) => {
       roomId = targetRoomId;
       playerRooms.set(requestedPlayerId, targetRoomId);
 
-      ws.send(
-        JSON.stringify({
-          type: 'ROOM_JOINED',
-          roomId: targetRoomId,
-          playerId: requestedPlayerId,
-          playerName: existing.name,
-          reconnected: true
-        })
-      );
-      return;
-    }
+      logger.info('player_reconnected', {
+        roomId: targetRoomId,
+        playerId: requestedPlayerId,
+        playerName: existing.name
+      });
+        ws.send(
+          JSON.stringify({
+            type: 'ROOM_JOINED',
+            roomId: targetRoomId,
+            playerId: requestedPlayerId,
+            playerName: existing.name,
+            reconnected: true
+          })
+        );
+        // Ensure the reconnecting client ends up with the latest authoritative state,
+        // even if message arrival order is not deterministic on the frontend.
+        game.sendGameStateToAll();
+        return;
+      }
 
     // Normal join (only allowed while waiting).
     playerId = requestedPlayerId;
@@ -172,16 +186,22 @@ wss.on('connection', (ws: WebSocket) => {
     }
 
     playerRooms.set(requestedPlayerId, targetRoomId);
-    ws.send(
-      JSON.stringify({
-        type: 'ROOM_JOINED',
-        roomId: targetRoomId,
-        playerId: requestedPlayerId,
-        playerName: requestedPlayerName,
-        reconnected: false
-      })
-    );
-  }
+    logger.info('player_joined', {
+      roomId: targetRoomId,
+      playerId: requestedPlayerId,
+      playerName: requestedPlayerName
+    });
+      ws.send(
+        JSON.stringify({
+          type: 'ROOM_JOINED',
+          roomId: targetRoomId,
+          playerId: requestedPlayerId,
+          playerName: requestedPlayerName,
+          reconnected: false
+        })
+      );
+      game.sendGameStateToAll();
+    }
 
   function handleStartGame() {
     if (!roomId) {
@@ -203,7 +223,10 @@ wss.on('connection', (ws: WebSocket) => {
           message: 'Unable to start game'
         })
       );
+      logger.warn('start_game_failed', { roomId });
+      return;
     }
+    logger.info('game_started', { roomId });
   }
 
   function handlePlayerAction(message: any) {
@@ -227,6 +250,7 @@ wss.on('connection', (ws: WebSocket) => {
           message: 'This connection is no longer active for the player'
         })
       );
+      logger.warn('stale_socket_action_ignored', { roomId, playerId });
       return;
     }
 
@@ -237,6 +261,7 @@ wss.on('connection', (ws: WebSocket) => {
       playerId
     };
 
+    logger.debug('player_action', { roomId, playerId, actionType: action.type });
     game.handlePlayerAction(action);
   }
 
@@ -255,6 +280,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
     }
 
+    logger.info('player_left', { roomId, playerId, playerName });
     playerRooms.delete(playerId);
     try {
       ws.close();
@@ -271,6 +297,7 @@ wss.on('connection', (ws: WebSocket) => {
     if (currentWs && currentWs !== closedWs) return;
 
     game.disconnectPlayer(playerId);
+    logger.info('player_disconnected', { roomId, playerId });
 
     const existingTimer = disconnectTimers.get(playerId);
     if (existingTimer) clearTimeout(existingTimer);
@@ -288,6 +315,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
       playerRooms.delete(pid);
       disconnectTimers.delete(pid);
+      logger.info('disconnect_grace_expired_removed', { roomId: actualRoomId, playerId: pid });
     }, DISCONNECT_GRACE_MS);
 
     disconnectTimers.set(playerId, timer);
