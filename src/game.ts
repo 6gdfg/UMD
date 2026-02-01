@@ -8,6 +8,11 @@ import { Player, createPlayer, dealCards, removeCardsFromHand, hasCards, getPlay
 import WebSocket from 'ws';
 import { logger } from './logger';
 
+const CLAIM_TIMEOUT_MS = (() => {
+  const n = Number(process.env.CLAIM_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 5000;
+})();
+
 export enum GamePhase {
   WAITING = 'waiting',
   PLAYING = 'playing',
@@ -516,14 +521,15 @@ export class Game {
       type: 'POTENTIAL_ACTION',
       actions: type ? [type] : [],
       targetCard,
-      candidates: step.actions.map(a => ({ type: a.type, cards: a.cards }))
+      candidates: step.actions.map(a => ({ type: a.type, cards: a.cards })),
+      timeoutMs: CLAIM_TIMEOUT_MS
     });
 
     this.actionTimeout = setTimeout(() => {
       this.pendingActions = [];
       this.claimQueueIndex++;
       this.promptNextClaimCandidate();
-    }, 5000);
+    }, CLAIM_TIMEOUT_MS);
   }
 
   private removeCardFromDiscardPile(cardId: string): void {
@@ -1092,24 +1098,13 @@ export class Game {
   }
 
   private handleChi(player: Player, cards: Card[]): void {
-    const action = this.pendingActions.find(a => 
-      a.playerId === player.id && a.type === 'CHI'
-    );
+    const chiOptions = this.pendingActions.filter(a => a.playerId === player.id && a.type === 'CHI');
 
-    if (!action) {
+    if (chiOptions.length === 0) {
       this.sendToPlayer(player.id, {
         type: 'ACTION_VALIDATION',
         isValid: false,
-        message: '无法吃牌'
-      });
-      return;
-    }
-
-    if (!hasCards(player, cards)) {
-      this.sendToPlayer(player.id, {
-        type: 'ACTION_VALIDATION',
-        isValid: false,
-        message: '你没有这些牌'
+        message: '无法吃牌（窗口已过期或当前不可吃）'
       });
       return;
     }
@@ -1120,25 +1115,96 @@ export class Game {
       this.actionTimeout = null;
     }
 
-    // Ensure the provided cards match one of the offered CHI candidates.
-    const chiCandidate = this.pendingActions.find(a =>
-      a.playerId === player.id &&
-      a.type === 'CHI' &&
-      a.cards.length === cards.length &&
-      a.cards.every(c => cards.some(x => x.id === c.id))
-    );
-    if (!chiCandidate) {
+    const provided = cards || [];
+
+    const matchesById = (candidate: Card[], selected: Card[]) => {
+      if (candidate.length !== selected.length) return false;
+      return candidate.every(c => selected.some(s => s.id && s.id === c.id));
+    };
+
+    const matchesByIdentity = (candidate: Card[], selected: Card[]) => {
+      if (candidate.length !== selected.length) return false;
+      const used = new Array(selected.length).fill(false);
+      for (const c of candidate) {
+        let found = false;
+        for (let i = 0; i < selected.length; i++) {
+          if (used[i]) continue;
+          if (cardsAreIdentical(c, selected[i])) {
+            used[i] = true;
+            found = true;
+            break;
+          }
+        }
+        if (!found) return false;
+      }
+      return true;
+    };
+
+    let chiCandidate: PotentialAction | undefined;
+    if (provided.length === 0) {
+      // If the client didn't specify which 2 cards to use for CHI, auto-select only when unambiguous.
+      if (chiOptions.length === 1) {
+        chiCandidate = chiOptions[0];
+      } else {
+        this.sendToPlayer(player.id, {
+          type: 'ACTION_VALIDATION',
+          isValid: false,
+          message: '吃牌需要选择两张牌（前端需传 cards）'
+        });
+        return;
+      }
+    } else {
+      chiCandidate =
+        chiOptions.find(a => matchesById(a.cards, provided)) ??
+        chiOptions.find(a => matchesByIdentity(a.cards, provided));
+
+      if (!chiCandidate) {
+        this.sendToPlayer(player.id, {
+          type: 'ACTION_VALIDATION',
+          isValid: false,
+          message: '无法吃牌（选择的组合不在候选项中）'
+        });
+        return;
+      }
+    }
+
+    if (!hasCards(player, chiCandidate.cards)) {
+      logger.warn('chi_invalid_missing_cards', {
+        roomId: this.roomId,
+        playerId: player.id,
+        provided: provided.map(c => ({ id: c.id, color: c.color, type: c.type, value: c.value })),
+        candidate: chiCandidate.cards.map(c => ({ id: c.id, color: c.color, type: c.type, value: c.value }))
+      });
       this.sendToPlayer(player.id, {
         type: 'ACTION_VALIDATION',
         isValid: false,
-        message: '无法吃牌'
+        message: '你没有这些牌'
       });
       return;
     }
 
     // 执行吃牌
-    removeCardsFromHand(player, cards);
-    const meldedSet = [...cards, action.targetCard];
+    const removed = removeCardsFromHand(player, chiCandidate.cards);
+    if (!removed) {
+      logger.error('chi_failed_remove_cards', {
+        roomId: this.roomId,
+        playerId: player.id,
+        candidate: chiCandidate.cards.map(c => ({ id: c.id, color: c.color, type: c.type, value: c.value }))
+      });
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '无法吃牌（服务器状态异常：移除手牌失败）'
+      });
+      return;
+    }
+
+    const meldedSet = [...chiCandidate.cards, chiCandidate.targetCard].sort((a, b) => {
+      const av = Number(a.value);
+      const bv = Number(b.value);
+      if (Number.isFinite(av) && Number.isFinite(bv)) return av - bv;
+      return 0;
+    });
     player.meldedCards.push(meldedSet);
 
       this.broadcast({
@@ -1149,7 +1215,7 @@ export class Game {
       logger.info('chi_performed', {
         roomId: this.roomId,
         playerId: player.id,
-        target: { color: action.targetCard.color, type: action.targetCard.type, value: action.targetCard.value },
+        target: { color: chiCandidate.targetCard.color, type: chiCandidate.targetCard.type, value: chiCandidate.targetCard.value },
         meld: meldedSet.map(c => ({ color: c.color, type: c.type, value: c.value }))
       });
 
@@ -1157,7 +1223,7 @@ export class Game {
     this.pendingEffect = null;
     this.claimQueue = [];
     this.claimQueueIndex = 0;
-    this.removeCardFromDiscardPile(action.targetCard.id);
+    this.removeCardFromDiscardPile(chiCandidate.targetCard.id);
     this.startNewRoundWithLeader(player.id);
     this.sendGameStateToAll();
   }
@@ -1184,7 +1250,34 @@ export class Game {
       this.actionTimeout = null;
     }
 
-    removeCardsFromHand(player, action.cards);
+    if (!hasCards(player, action.cards)) {
+      logger.warn('peng_invalid_missing_cards', {
+        roomId: this.roomId,
+        playerId: player.id,
+        candidate: action.cards.map(c => ({ id: c.id, color: c.color, type: c.type, value: c.value }))
+      });
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '你没有这些牌'
+      });
+      return;
+    }
+
+    const removed = removeCardsFromHand(player, action.cards);
+    if (!removed) {
+      logger.error('peng_failed_remove_cards', {
+        roomId: this.roomId,
+        playerId: player.id,
+        candidate: action.cards.map(c => ({ id: c.id, color: c.color, type: c.type, value: c.value }))
+      });
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '无法碰牌（服务器状态异常：移除手牌失败）'
+      });
+      return;
+    }
     const meldedSet = [...action.cards, action.targetCard];
     player.meldedCards.push(meldedSet);
 
@@ -1245,7 +1338,34 @@ export class Game {
       this.actionTimeout = null;
     }
 
-    removeCardsFromHand(player, action.cards);
+    if (!hasCards(player, action.cards)) {
+      logger.warn('gang_invalid_missing_cards', {
+        roomId: this.roomId,
+        playerId: player.id,
+        candidate: action.cards.map(c => ({ id: c.id, color: c.color, type: c.type, value: c.value }))
+      });
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '你没有这些牌'
+      });
+      return;
+    }
+
+    const removed = removeCardsFromHand(player, action.cards);
+    if (!removed) {
+      logger.error('gang_failed_remove_cards', {
+        roomId: this.roomId,
+        playerId: player.id,
+        candidate: action.cards.map(c => ({ id: c.id, color: c.color, type: c.type, value: c.value }))
+      });
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '无法杠牌（服务器状态异常：移除手牌失败）'
+      });
+      return;
+    }
     const meldedSet = [...action.cards, action.targetCard];
     player.meldedCards.push(meldedSet);
 
