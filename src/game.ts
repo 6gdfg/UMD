@@ -201,7 +201,7 @@ export class Game {
 
   addPlayer(id: string, name: string, ws: WebSocket): boolean {
     if (this.gamePhase !== GamePhase.WAITING) return false;
-    if (this.players.length >= 10) return false;
+    if (this.players.length >= 8) return false;
     if (this.players.some(p => p.id === id)) return false;
 
     const player = createPlayer(id, name, ws);
@@ -769,9 +769,10 @@ export class Game {
     const lastType = this.lastPlayedHandType;
     if (!lastType) return true;
 
-    // UNO-style phase (single / pair / triple): allow switching into other hand types,
-    // as long as the played hand matches the current effective color (or is wild/bomb handled above).
-    if (lastType === HandType.SINGLE || lastType === HandType.PAIR || lastType === HandType.TRIPLE) {
+    // UNO-style rounds:
+    // - If the last hand is SINGLE: allow switching into colored combos as long as they match the active color.
+    // - If the last hand is PAIR/TRIPLE: must follow with the same hand type (or bomb handled above).
+    if (lastType === HandType.SINGLE) {
       const activeColor =
         this.currentColor ?? (lastCards[0].color !== CardColor.WILD ? lastCards[0].color : null);
 
@@ -785,7 +786,6 @@ export class Game {
           return this.isValidSinglePlay(playedCards[0], lastCards[0]);
         case HandType.PAIR:
         case HandType.TRIPLE:
-          return this.compareGroups(playedCards, lastCards);
         case HandType.FULL_HOUSE:
         case HandType.STRAIGHT:
         case HandType.CONSECUTIVE_PAIRS:
@@ -794,6 +794,16 @@ export class Game {
         default:
           return false;
       }
+    }
+
+    if (lastType === HandType.PAIR) {
+      if (handType !== HandType.PAIR) return false;
+      return this.compareGroups(playedCards, lastCards);
+    }
+
+    if (lastType === HandType.TRIPLE) {
+      if (handType !== HandType.TRIPLE) return false;
+      return this.compareGroups(playedCards, lastCards);
     }
 
     // Combo rounds: must match the same hand type (bombs handled above).

@@ -41,10 +41,10 @@ export function createDeck(): Card[] {
   // 四种颜色
   const colors = [CardColor.RED, CardColor.YELLOW, CardColor.BLUE, CardColor.GREEN];
 
-  // 1. 生成数字牌 (304张)
+  // 1. 生成数字牌 (152张)
   for (const color of colors) {
     // 数字0：每色4张
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 2; i++) {
       deck.push({
         color,
         value: '0',
@@ -55,7 +55,7 @@ export function createDeck(): Card[] {
 
     // 数字1-9：每色每个数字8张
     for (let num = 1; num <= 9; num++) {
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 4; i++) {
         deck.push({
           color,
           value: num.toString(),
