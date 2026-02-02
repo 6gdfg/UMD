@@ -13,6 +13,11 @@ const CLAIM_TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 5000;
 })();
 
+const UNO_CALL_TIMEOUT_MS = (() => {
+  const n = Number(process.env.UNO_CALL_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 3000;
+})();
+
 export enum GamePhase {
   WAITING = 'waiting',
   PLAYING = 'playing',
@@ -70,10 +75,81 @@ export class Game {
   roomId: string;
   hasActiveRound: boolean = false;
   passCount: number = 0;
+  private unoTimers: Map<string, NodeJS.Timeout> = new Map();
+  private unoDeadlineMsByPlayerId: Map<string, number> = new Map();
 
   constructor(roomId: string) {
     this.roomId = roomId;
     this.deck = shuffleDeck(createDeck());
+  }
+
+  private clearUnoTimer(playerId: string): void {
+    const timer = this.unoTimers.get(playerId);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    this.unoTimers.delete(playerId);
+    this.unoDeadlineMsByPlayerId.delete(playerId);
+  }
+
+  private onPlayerHandChanged(player: Player): void {
+    // Reset UNO state when player no longer has exactly 1 card.
+    if (player.hand.length !== 1) {
+      if (player.hasCalledUno) {
+        player.hasCalledUno = false;
+      }
+      this.clearUnoTimer(player.id);
+      return;
+    }
+
+    // Exactly 1 card left: require UNO unless already declared.
+    if (player.hasCalledUno) {
+      this.clearUnoTimer(player.id);
+      return;
+    }
+
+    // Avoid scheduling multiple timers for the same player.
+    if (this.unoTimers.has(player.id)) {
+      return;
+    }
+
+    const deadlineMs = Date.now() + UNO_CALL_TIMEOUT_MS;
+    this.unoDeadlineMsByPlayerId.set(player.id, deadlineMs);
+
+    this.broadcast({
+      type: 'UNO_REQUIRED',
+      playerId: player.id,
+      playerName: player.name,
+      timeoutMs: UNO_CALL_TIMEOUT_MS,
+      deadlineMs
+    });
+    logger.info('uno_required', {
+      roomId: this.roomId,
+      playerId: player.id,
+      timeoutMs: UNO_CALL_TIMEOUT_MS
+    });
+
+    const timer = setTimeout(() => {
+      this.unoTimers.delete(player.id);
+      this.unoDeadlineMsByPlayerId.delete(player.id);
+
+      if (this.gamePhase !== GamePhase.PLAYING) return;
+      const latest = this.getPlayerById(player.id);
+      if (!latest) return;
+
+      if (!latest.hasCalledUno && latest.hand.length === 1) {
+        logger.info('uno_penalty', { roomId: this.roomId, playerId: latest.id });
+        this.broadcast({
+          type: 'UNO_PENALTY',
+          playerId: latest.id,
+          message: `${latest.name}未宣告UNO，罚摸2张`
+        });
+        this.drawCardsForPlayer(latest, 2);
+        this.sendGameStateToAll();
+      }
+    }, UNO_CALL_TIMEOUT_MS);
+
+    this.unoTimers.set(player.id, timer);
   }
 
   private getPlayerById(playerId: string): Player | undefined {
@@ -143,6 +219,7 @@ export class Game {
   }
 
   removePlayer(playerId: string): void {
+    this.clearUnoTimer(playerId);
     const index = this.players.findIndex(p => p.id === playerId);
     if (index !== -1) {
       const wasCurrent = index === this.currentPlayerIndex;
@@ -399,18 +476,7 @@ export class Game {
         return;
       }
 
-    if (player.hand.length === 1 && !player.hasCalledUno) {
-      setTimeout(() => {
-        if (!player.hasCalledUno && player.hand.length === 1) {
-          this.broadcast({
-            type: 'UNO_PENALTY',
-            playerId: player.id,
-            message: `${player.name}未宣告UNO，罚摸2张`
-          });
-          this.drawCardsForPlayer(player, 2);
-        }
-      }, 5000);
-    }
+    this.onPlayerHandChanged(player);
 
     if (handType === HandType.SINGLE) {
       // Give other players a chance to CHI/PENG/GANG before this card's effect triggers.
@@ -1225,6 +1291,7 @@ export class Game {
     this.claimQueueIndex = 0;
     this.removeCardFromDiscardPile(chiCandidate.targetCard.id);
     this.startNewRoundWithLeader(player.id);
+    this.onPlayerHandChanged(player);
     this.sendGameStateToAll();
   }
 
@@ -1313,6 +1380,7 @@ export class Game {
     this.claimQueueIndex = 0;
     this.removeCardFromDiscardPile(action.targetCard.id);
     this.startNewRoundWithLeader(player.id);
+    this.onPlayerHandChanged(player);
     this.sendGameStateToAll();
   }
 
@@ -1509,14 +1577,27 @@ export class Game {
    * 处理UNO宣告
    */
   private handleDeclareUno(player: Player): void {
-    if (player.hand.length === 1) {
-      player.hasCalledUno = true;
-      this.broadcast({
-        type: 'UNO_DECLARED',
-        playerId: player.id,
-        playerName: player.name
+    if (player.hand.length !== 1) {
+      this.sendToPlayer(player.id, {
+        type: 'ACTION_VALIDATION',
+        isValid: false,
+        message: '只有手牌剩1张时才能宣告UNO'
       });
+      return;
     }
+
+    if (player.hasCalledUno) return;
+
+    player.hasCalledUno = true;
+    this.clearUnoTimer(player.id);
+    logger.info('uno_declared', { roomId: this.roomId, playerId: player.id });
+
+    this.broadcast({
+      type: 'UNO_DECLARED',
+      playerId: player.id,
+      playerName: player.name
+    });
+    this.sendGameStateToAll();
   }
 
   /**
@@ -1553,6 +1634,8 @@ export class Game {
       playerId: player.id,
       count: drawnCards.length
     });
+
+    this.onPlayerHandChanged(player);
   }
 
   /**
@@ -1630,6 +1713,11 @@ export class Game {
   private endGame(winnerId: string): void {
     this.gamePhase = GamePhase.ENDED;
     const winner = this.players.find(p => p.id === winnerId);
+    for (const timer of this.unoTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.unoTimers.clear();
+    this.unoDeadlineMsByPlayerId.clear();
 
     this.broadcast({
       type: 'GAME_OVER',
@@ -1678,7 +1766,13 @@ export class Game {
           pendingDrawType: this.pendingDrawType,
           deckCount: this.deck.length,
           players: this.players.map(p => 
-            p.id === player.id ? getPlayerPrivateInfo(p) : getPlayerPublicInfo(p)
+            p.id === player.id
+              ? {
+                  ...getPlayerPrivateInfo(p),
+                  unoDeadlineMs: this.unoDeadlineMsByPlayerId.get(p.id) ?? null,
+                  unoCallTimeoutMs: UNO_CALL_TIMEOUT_MS
+                }
+              : getPlayerPublicInfo(p)
           )
         }
       });
