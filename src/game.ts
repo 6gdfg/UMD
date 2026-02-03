@@ -552,10 +552,10 @@ export class Game {
       if (player.hand.some(c => c.type === CardType.DRAW_TWO || c.type === CardType.WILD_DRAW_FOUR)) return true;
     }
 
-    // Bomb response: 4+ identical cards (same color/type/value).
+    // Bomb response: 4+ identical cards (same type/value; color doesn't matter).
     const counts = new Map<string, number>();
     for (const c of player.hand) {
-      const key = `${c.color}|${c.type}|${c.value}`;
+      const key = `${c.type}|${c.value}`;
       const next = (counts.get(key) || 0) + 1;
       if (next >= 4) return true;
       counts.set(key, next);
@@ -643,6 +643,13 @@ export class Game {
     if (cards.length === 0) return null;
 
     if (cards.length === 1) return HandType.SINGLE;
+
+    // 炸弹：4张及以上同“符号”(type+value)，颜色可不同
+    if (cards.length >= 4) {
+      const first = cards[0];
+      const sameSymbol = cards.every(c => c.type === first.type && c.value === first.value);
+      if (sameSymbol) return HandType.BOMB;
+    }
 
     // 检查是否所有牌完全相同
     const allSame = cards.every(c => cardsAreIdentical(c, cards[0]));
@@ -770,30 +777,11 @@ export class Game {
     if (!lastType) return true;
 
     // UNO-style rounds:
-    // - If the last hand is SINGLE: allow switching into colored combos as long as they match the active color.
+    // - If the last hand is SINGLE: must follow with SINGLE (or bomb handled above).
     // - If the last hand is PAIR/TRIPLE: must follow with the same hand type (or bomb handled above).
     if (lastType === HandType.SINGLE) {
-      const activeColor =
-        this.currentColor ?? (lastCards[0].color !== CardColor.WILD ? lastCards[0].color : null);
-
-      const allMatchActiveColor =
-        !!activeColor &&
-        playedCards.length > 0 &&
-        playedCards.every(c => c.color !== CardColor.WILD && c.color === activeColor);
-
-      switch (handType) {
-        case HandType.SINGLE:
-          return this.isValidSinglePlay(playedCards[0], lastCards[0]);
-        case HandType.PAIR:
-        case HandType.TRIPLE:
-        case HandType.FULL_HOUSE:
-        case HandType.STRAIGHT:
-        case HandType.CONSECUTIVE_PAIRS:
-        case HandType.AIRPLANE:
-          return allMatchActiveColor;
-        default:
-          return false;
-      }
+      if (handType !== HandType.SINGLE) return false;
+      return this.isValidSinglePlay(playedCards[0], lastCards[0]);
     }
 
     if (lastType === HandType.PAIR) {
@@ -1371,12 +1359,14 @@ export class Game {
 
     // 处理+2或+4的碰
     if (action.targetCard.type === CardType.DRAW_TWO) {
+      logger.info('peng_global_draw', { roomId: this.roomId, by: player.id, count: 2 });
       for (const p of this.players) {
         if (p.id !== player.id) {
           this.drawCardsForPlayer(p, 2);
         }
       }
     } else if (action.targetCard.type === CardType.WILD_DRAW_FOUR) {
+      logger.info('peng_global_draw', { roomId: this.roomId, by: player.id, count: 4 });
       for (const p of this.players) {
         if (p.id !== player.id) {
           this.drawCardsForPlayer(p, 4);
@@ -1460,12 +1450,14 @@ export class Game {
 
     // 处理+2或+4的杠
     if (action.targetCard.type === CardType.DRAW_TWO) {
+      logger.info('gang_global_draw', { roomId: this.roomId, by: player.id, count: 2 });
       for (const p of this.players) {
         if (p.id !== player.id) {
           this.drawCardsForPlayer(p, 2);
         }
       }
     } else if (action.targetCard.type === CardType.WILD_DRAW_FOUR) {
+      logger.info('gang_global_draw', { roomId: this.roomId, by: player.id, count: 4 });
       for (const p of this.players) {
         if (p.id !== player.id) {
           this.drawCardsForPlayer(p, 4);
@@ -1560,18 +1552,13 @@ export class Game {
       playerId: player.id
     });
 
-    // UNO-style turns (SINGLE / PAIR / TRIPLE): draw 1 then immediately pass the turn; do NOT start a new round.
-    if (
-      this.hasActiveRound &&
-      (this.lastPlayedHandType === HandType.SINGLE ||
-        this.lastPlayedHandType === HandType.PAIR ||
-        this.lastPlayedHandType === HandType.TRIPLE)
-    ) {
+    // 单张模式：摸1张后直接过（不参与“全员pass清空要求”）
+    if (this.hasActiveRound && this.lastPlayedHandType === HandType.SINGLE) {
       this.nextTurn();
       return;
     }
 
-    // Combo-round pass rule: if everyone else passed, the last player who played becomes the leader.
+    // 非单张模式（对子/三张/组合）：如果其余所有人都pass一轮，则清空出牌要求
     this.passCount++;
     if (this.passCount >= this.players.length - 1 && this.lastPlayedBy) {
       const leaderId = this.lastPlayedBy;
