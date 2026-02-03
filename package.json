@@ -7,7 +7,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "watch": "tsc -w"
+    "watch": "tsc -w",
+    "verify:rules": "node scripts/verify-rules.js"
   },
   "keywords": ["websocket", "game", "card-game", "uno", "mahjong"],
   "author": "",

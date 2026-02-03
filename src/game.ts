@@ -406,12 +406,10 @@ export class Game {
       // otherwise they must accept the penalty via PASS/DRAW_CARD.
       if (this.pendingDrawCount > 0) {
       const isBomb = handType === HandType.BOMB;
+      const isPureDraw2 = cards.length > 0 && cards.every(c => c.type === CardType.DRAW_TWO);
+      const isPureDraw4 = cards.length > 0 && cards.every(c => c.type === CardType.WILD_DRAW_FOUR);
       const isDrawResponse =
-        handType === HandType.SINGLE &&
-        cards.length === 1 &&
-        (this.pendingDrawType === CardType.WILD_DRAW_FOUR
-          ? cards[0].type === CardType.WILD_DRAW_FOUR
-          : cards[0].type === CardType.DRAW_TWO || cards[0].type === CardType.WILD_DRAW_FOUR);
+        this.pendingDrawType === CardType.WILD_DRAW_FOUR ? isPureDraw4 : isPureDraw2 || isPureDraw4;
 
       if (!isBomb && !isDrawResponse) {
         const allowText =
@@ -488,8 +486,8 @@ export class Game {
       return;
     }
 
-    // For non-single hands, apply effects once (if any) and advance the turn.
-    this.applyCardEffects([cards[0]], player, chosenColor);
+    // For non-single hands, apply effects based on all played cards (pairs/triples/full-house can include special cards).
+    this.applyCardEffects(cards, player, chosenColor);
     this.nextTurn();
   }
 
@@ -655,10 +653,7 @@ export class Game {
     const allSame = cards.every(c => cardsAreIdentical(c, cards[0]));
     
     if (allSame) {
-      // Disallow forming pairs/triples with special UNO cards (+2/+4/skip/reverse/wild).
-      // They must be played as SINGLE (UNO style). Bombs (4+) are still allowed.
       if (cards.length === 2 || cards.length === 3) {
-        if (cards[0].type !== CardType.NUMBER) return null;
         if (cards.length === 2) return HandType.PAIR;
         return HandType.TRIPLE;
       }
@@ -702,17 +697,22 @@ export class Game {
   }
 
   private isConsecutivePairs(cards: Card[]): boolean {
-    const counts = new Map<number, number>();
+    const groups = new Map<number, Card[]>();
 
     for (const card of cards) {
       if (card.type !== CardType.NUMBER) return false;
       const value = parseInt(card.value);
-      counts.set(value, (counts.get(value) || 0) + 1);
+      const list = groups.get(value) || [];
+      list.push(card);
+      groups.set(value, list);
     }
 
-    const values = Array.from(counts.keys()).sort((a, b) => a - b);
+    const values = Array.from(groups.keys()).sort((a, b) => a - b);
     for (const v of values) {
-      if (counts.get(v) !== 2) return false;
+      const pair = groups.get(v);
+      if (!pair || pair.length !== 2) return false;
+      // 每一对必须同色
+      if (pair[0].color !== pair[1].color) return false;
     }
 
     for (let i = 1; i < values.length; i++) {
@@ -723,17 +723,24 @@ export class Game {
   }
 
   private isAirplane(cards: Card[]): boolean {
-    const counts = new Map<number, number>();
+    const groups = new Map<number, Card[]>();
 
     for (const card of cards) {
       if (card.type !== CardType.NUMBER) return false;
       const value = parseInt(card.value);
-      counts.set(value, (counts.get(value) || 0) + 1);
+      const list = groups.get(value) || [];
+      list.push(card);
+      groups.set(value, list);
     }
 
-    const values = Array.from(counts.keys()).sort((a, b) => a - b);
+    const values = Array.from(groups.keys()).sort((a, b) => a - b);
     for (const v of values) {
-      if (counts.get(v) !== 3) return false;
+      const triple = groups.get(v);
+      if (!triple || triple.length !== 3) return false;
+      // 每组三张必须同色（两组之间可跨色）
+      if (!(triple[0].color === triple[1].color && triple[1].color === triple[2].color)) {
+        return false;
+      }
     }
 
     for (let i = 1; i < values.length; i++) {
@@ -744,12 +751,20 @@ export class Game {
   }
 
   private isFullHouse(cards: Card[]): boolean {
-    const counts = new Map<number, number>();
+    // 三带二：允许数字/跳过/翻转参与；每一组内部必须同色（3张同色 + 2张同色）
+    if (cards.length !== 5) return false;
+    const counts = new Map<string, number>();
 
     for (const card of cards) {
-      if (card.type !== CardType.NUMBER) return false;
-      const value = parseInt(card.value);
-      counts.set(value, (counts.get(value) || 0) + 1);
+      if (
+        card.type !== CardType.NUMBER &&
+        card.type !== CardType.SKIP &&
+        card.type !== CardType.REVERSE
+      ) {
+        return false;
+      }
+      const key = `${card.color}|${card.type}|${card.value}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
     }
 
     if (counts.size !== 2) return false;
@@ -929,24 +944,40 @@ export class Game {
    * 应用卡牌效果
    */
   private applyCardEffects(cards: Card[], player: Player, chosenColor: CardColor | null): void {
-    for (const card of cards) {
-      switch (card.type) {
-        case CardType.SKIP: {
-          const nextIndex = this.getNextPlayerIndex();
-          this.players[nextIndex].isSkipped = true;
-          this.broadcast({
-            type: 'PLAYER_SKIPPED',
-            playerId: this.players[nextIndex].id
-          });
-          logger.info('effect_skip', {
-            roomId: this.roomId,
-            by: player.id,
-            target: this.players[nextIndex].id
-          });
-          break;
-        }
+    if (!cards || cards.length === 0) return;
 
-        case CardType.REVERSE: {
+    const skipCount = cards.filter(c => c.type === CardType.SKIP).length;
+    const reverseCount = cards.filter(c => c.type === CardType.REVERSE).length;
+    const draw2Count = cards.filter(c => c.type === CardType.DRAW_TWO).length;
+    const wildCount = cards.filter(c => c.type === CardType.WILD).length;
+    const draw4Count = cards.filter(c => c.type === CardType.WILD_DRAW_FOUR).length;
+
+    // Wild color selection: apply once (even if multiple wilds are played together).
+    if ((wildCount > 0 || draw4Count > 0) && chosenColor) {
+      this.currentColor = chosenColor;
+      this.broadcast({
+        type: 'COLOR_CHANGED',
+        color: chosenColor
+      });
+      logger.info('effect_wild_color', {
+        roomId: this.roomId,
+        by: player.id,
+        color: chosenColor,
+        wildCount,
+        draw4Count
+      });
+    }
+
+    // Reverse:
+    // - 2 players: Reverse behaves like Skip. Even count => no effect; odd count => skip 1.
+    // - 3+ players: odd count flips direction; even count => no net change.
+    let effectiveSkipCount = skipCount;
+    if (reverseCount > 0) {
+      if (this.players.length === 2) {
+        effectiveSkipCount += reverseCount;
+        logger.info('effect_reverse_as_skip_2p', { roomId: this.roomId, by: player.id, count: reverseCount });
+      } else {
+        if (reverseCount % 2 === 1) {
           this.turnDirection *= -1;
           this.broadcast({
             type: 'DIRECTION_REVERSED',
@@ -955,80 +986,74 @@ export class Game {
           logger.info('effect_reverse', {
             roomId: this.roomId,
             by: player.id,
+            count: reverseCount,
             direction: this.turnDirection
           });
-
-          // UNO: in 2-player mode, Reverse acts like Skip.
-          if (this.players.length === 2) {
-            const nextIndex = this.getNextPlayerIndex();
-            this.players[nextIndex].isSkipped = true;
-            this.broadcast({
-              type: 'PLAYER_SKIPPED',
-              playerId: this.players[nextIndex].id
-            });
-            logger.info('effect_reverse_as_skip_2p', {
-              roomId: this.roomId,
-              by: player.id,
-              target: this.players[nextIndex].id
-            });
-          }
-          break;
-        }
-
-        case CardType.DRAW_TWO: {
-          // UNO stacking: accumulate the draw penalty; the next player may respond with +2/+4 or a bomb.
-          this.pendingDrawCount += 2;
-          this.pendingDrawType = CardType.DRAW_TWO;
-          this.broadcast({
-            type: 'PENDING_DRAW_UPDATED',
-            count: this.pendingDrawCount
-          });
-          logger.info('effect_draw2_pending', {
-            roomId: this.roomId,
-            by: player.id,
-            pendingDrawCount: this.pendingDrawCount,
-            pendingDrawType: this.pendingDrawType
-          });
-          break;
-        }
-
-        case CardType.WILD: {
-          if (chosenColor) {
-            this.currentColor = chosenColor;
-            this.broadcast({
-              type: 'COLOR_CHANGED',
-              color: chosenColor
-            });
-            logger.info('effect_wild_color', { roomId: this.roomId, by: player.id, color: chosenColor });
-          }
-          break;
-        }
-
-        case CardType.WILD_DRAW_FOUR: {
-          if (chosenColor) {
-            this.currentColor = chosenColor;
-            this.broadcast({
-              type: 'COLOR_CHANGED',
-              color: chosenColor
-            });
-            logger.info('effect_wild_draw4_color', { roomId: this.roomId, by: player.id, color: chosenColor });
-          }
-          // UNO stacking: accumulate the draw penalty; the next player may respond with +2/+4 or a bomb.
-          this.pendingDrawCount += 4;
-          this.pendingDrawType = CardType.WILD_DRAW_FOUR;
-          this.broadcast({
-            type: 'PENDING_DRAW_UPDATED',
-            count: this.pendingDrawCount
-          });
-          logger.info('effect_draw4_pending', {
-            roomId: this.roomId,
-            by: player.id,
-            pendingDrawCount: this.pendingDrawCount,
-            pendingDrawType: this.pendingDrawType
-          });
-          break;
+        } else {
+          logger.info('effect_reverse_noop_even', { roomId: this.roomId, by: player.id, count: reverseCount });
         }
       }
+    }
+
+    // Skip: mark the next N players as skipped (N can come from SKIP cards, and from REVERSE in 2-player mode).
+    if (effectiveSkipCount > 0 && this.players.length > 0) {
+      if (this.players.length === 2) {
+        // Odd => you play again; even => no net effect.
+        if (effectiveSkipCount % 2 === 1) {
+          const nextIndex = this.getNextPlayerIndex();
+          this.players[nextIndex].isSkipped = true;
+          this.broadcast({
+            type: 'PLAYER_SKIPPED',
+            playerId: this.players[nextIndex].id
+          });
+          logger.info('effect_skip_2p', { roomId: this.roomId, by: player.id, count: effectiveSkipCount });
+        } else {
+          logger.info('effect_skip_noop_even_2p', { roomId: this.roomId, by: player.id, count: effectiveSkipCount });
+        }
+      } else {
+        const n = this.players.length;
+        const effective = effectiveSkipCount % n;
+        for (let i = 1; i <= effective; i++) {
+          const idx = (this.currentPlayerIndex + this.turnDirection * i + n * 1000) % n;
+          this.players[idx].isSkipped = true;
+          this.broadcast({
+            type: 'PLAYER_SKIPPED',
+            playerId: this.players[idx].id
+          });
+        }
+        logger.info('effect_skip', { roomId: this.roomId, by: player.id, count: effectiveSkipCount });
+      }
+    }
+
+    // +2 / +4 stacking: accumulate per card.
+    if (draw2Count > 0) {
+      this.pendingDrawCount += 2 * draw2Count;
+      // If a +4 is also played in this hand, pending type will be overridden below.
+      this.pendingDrawType = CardType.DRAW_TWO;
+      logger.info('effect_draw2_pending', {
+        roomId: this.roomId,
+        by: player.id,
+        count: draw2Count,
+        pendingDrawCount: this.pendingDrawCount
+      });
+    }
+
+    if (draw4Count > 0) {
+      this.pendingDrawCount += 4 * draw4Count;
+      this.pendingDrawType = CardType.WILD_DRAW_FOUR;
+      logger.info('effect_draw4_pending', {
+        roomId: this.roomId,
+        by: player.id,
+        count: draw4Count,
+        pendingDrawCount: this.pendingDrawCount
+      });
+    }
+
+    if (draw2Count > 0 || draw4Count > 0) {
+      this.broadcast({
+        type: 'PENDING_DRAW_UPDATED',
+        count: this.pendingDrawCount
+      });
     }
   }
 
