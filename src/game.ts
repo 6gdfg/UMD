@@ -18,6 +18,11 @@ const UNO_CALL_TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 3000;
 })();
 
+const TURN_TIMEOUT_MS = (() => {
+  const n = Number(process.env.TURN_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 12000;
+})();
+
 export enum GamePhase {
   WAITING = 'waiting',
   PLAYING = 'playing',
@@ -70,6 +75,8 @@ export class Game {
   pendingEffect: { card: Card; playedById: string; chosenColor: CardColor | null } | null = null;
   pendingActions: PotentialAction[] = [];
   actionTimeout: NodeJS.Timeout | null = null;
+  turnTimeout: NodeJS.Timeout | null = null;
+  turnDeadlineMs: number | null = null;
   claimQueue: ClaimStep[] = [];
   claimQueueIndex: number = 0;
   roomId: string;
@@ -81,6 +88,56 @@ export class Game {
   constructor(roomId: string) {
     this.roomId = roomId;
     this.deck = shuffleDeck(createDeck());
+  }
+
+  private clearTurnTimer(): void {
+    if (this.turnTimeout) {
+      clearTimeout(this.turnTimeout);
+    }
+    this.turnTimeout = null;
+    this.turnDeadlineMs = null;
+  }
+
+  private scheduleTurnTimer(): void {
+    this.clearTurnTimer();
+    if (this.gamePhase !== GamePhase.PLAYING) return;
+    if (this.players.length === 0) return;
+
+    // Claim windows (CHI/PENG/GANG) are handled by CLAIM_TIMEOUT_MS.
+    if (this.isClaimWindowActive()) return;
+
+    const current = this.players[this.currentPlayerIndex];
+    if (!current) return;
+
+    const currentPlayerId = current.id;
+    const deadlineMs = Date.now() + TURN_TIMEOUT_MS;
+    this.turnDeadlineMs = deadlineMs;
+
+    this.turnTimeout = setTimeout(() => {
+      // Ensure the timer is still for the same turn.
+      if (this.gamePhase !== GamePhase.PLAYING) return;
+      if (this.isClaimWindowActive()) return;
+      if (this.turnDeadlineMs !== deadlineMs) return;
+
+      const latest = this.players[this.currentPlayerIndex];
+      if (!latest || latest.id !== currentPlayerId) return;
+
+      logger.info('turn_timeout_auto_pass', {
+        roomId: this.roomId,
+        playerId: latest.id,
+        pendingDrawCount: this.pendingDrawCount,
+        pendingDrawType: this.pendingDrawType
+      });
+
+      this.broadcast({
+        type: 'TURN_TIMEOUT',
+        playerId: latest.id,
+        timeoutMs: TURN_TIMEOUT_MS
+      });
+
+      // Auto-pass: in penalty mode PASS means accept the penalty.
+      this.handlePass(latest);
+    }, TURN_TIMEOUT_MS);
   }
 
   private clearUnoTimer(playerId: string): void {
@@ -251,6 +308,8 @@ export class Game {
         }
 
         if (wasCurrent) {
+          this.clearTurnTimer();
+          this.scheduleTurnTimer();
           this.broadcast({
             type: 'TURN_CHANGED',
             currentPlayerId: this.players[this.currentPlayerIndex]?.id
@@ -281,6 +340,7 @@ export class Game {
       currentPlayerId: this.players[this.currentPlayerIndex].id
     });
 
+    this.scheduleTurnTimer();
     this.sendGameStateToAll();
     return true;
   }
@@ -431,6 +491,8 @@ export class Game {
       });
       return;
     }
+
+    this.clearTurnTimer();
 
     removeCardsFromHand(player, cards);
     this.lastPlayedHand = cards;
@@ -624,6 +686,8 @@ export class Game {
     if (leaderIndex >= 0) {
       this.currentPlayerIndex = leaderIndex;
     }
+
+    this.scheduleTurnTimer();
 
     this.broadcast({
       type: 'NEW_ROUND',
@@ -1513,6 +1577,8 @@ export class Game {
       return;
     }
 
+    this.clearTurnTimer();
+
       // If there is a pending +2/+4 chain, DRAW_CARD means "accept the penalty".
       if (this.pendingDrawCount > 0) {
         const count = this.pendingDrawCount;
@@ -1542,6 +1608,8 @@ export class Game {
     if (this.players[this.currentPlayerIndex].id !== player.id) {
       return;
     }
+
+    this.clearTurnTimer();
 
     if (player.isSkipped) {
       player.isSkipped = false;
@@ -1714,6 +1782,8 @@ export class Game {
       break;
     }
 
+    this.scheduleTurnTimer();
+
     this.broadcast({
       type: 'TURN_CHANGED',
       currentPlayerId: this.players[this.currentPlayerIndex].id
@@ -1734,6 +1804,7 @@ export class Game {
    */
   private endGame(winnerId: string): void {
     this.gamePhase = GamePhase.ENDED;
+    this.clearTurnTimer();
     const winner = this.players.find(p => p.id === winnerId);
     for (const timer of this.unoTimers.values()) {
       clearTimeout(timer);
@@ -1781,6 +1852,8 @@ export class Game {
           phase: this.gamePhase,
           currentPlayerId: this.players[this.currentPlayerIndex]?.id,
           turnDirection: this.turnDirection,
+          turnDeadlineMs: this.turnDeadlineMs,
+          turnTimeoutMs: TURN_TIMEOUT_MS,
           currentColor: this.currentColor,
           lastPlayedHand: this.lastPlayedHand,
           lastPlayedHandType: this.lastPlayedHandType,
