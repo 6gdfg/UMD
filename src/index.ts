@@ -1,15 +1,19 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import { Game, PlayerAction } from './game';
+import { CoinSettlementPayload, Game, PlayerAction } from './game';
 import { logger } from './logger';
+import { verifyAuthToken } from './auth';
+import { getUserById, persistCoinSettlement } from './coin-store';
 
 const games = new Map<string, Game>();
 const playerRooms = new Map<string, string>();
+const runtimePlayerToUserId = new Map<string, string>();
 
 // Allow quick app/browser switch without "instant elimination".
 // If the player reconnects with the same playerId within this window, they keep the seat.
 const DISCONNECT_GRACE_MS = 10_000;
 const disconnectTimers = new Map<string, NodeJS.Timeout>();
+const DEFAULT_BASE_BET = 100;
 
 const server = createServer((req, res) => {
   if (req.url === '/healthz') {
@@ -34,23 +38,85 @@ function generatePlayerId(): string {
   return `player_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
+function parseBaseBet(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_BASE_BET;
+  return Math.floor(n);
+}
+
+function userAlreadyInActiveRoom(userId: string, exceptPlayerId?: string): boolean {
+  for (const [runtimePlayerId, mappedUserId] of runtimePlayerToUserId.entries()) {
+    if (mappedUserId !== userId) continue;
+    if (exceptPlayerId && runtimePlayerId === exceptPlayerId) continue;
+
+    const rid = playerRooms.get(runtimePlayerId);
+    if (!rid) continue;
+
+    const game = games.get(rid);
+    if (!game) continue;
+
+    const exists = game.players.some(player => player.id === runtimePlayerId);
+    if (exists) return true;
+  }
+
+  return false;
+}
+
+function attachCoinSettlementPersistence(game: Game): void {
+  game.setCoinSettlementHandler(async (payload: CoinSettlementPayload) => {
+    const updates: Array<{ userId: string; coins: number }> = [];
+    for (const detail of payload.details) {
+      const userId = runtimePlayerToUserId.get(detail.playerId);
+      if (!userId) {
+        logger.warn('coin_settlement_user_mapping_missing', {
+          roomId: payload.roomId,
+          playerId: detail.playerId
+        });
+        continue;
+      }
+      updates.push({ userId, coins: detail.after });
+    }
+
+    if (updates.length === 0) return;
+    await persistCoinSettlement(updates);
+    logger.info('coin_settlement_persisted', {
+      roomId: payload.roomId,
+      winnerId: payload.winnerId,
+      affectedUsers: updates.length
+    });
+  });
+}
+
 wss.on('connection', (ws: WebSocket) => {
   logger.info('ws_connected');
   let playerId: string | null = null;
   let playerName: string | null = null;
   let roomId: string | null = null;
+  let authUserId: string | null = null;
 
-  ws.on('message', (data: string) => {
+  ws.on('message', async (data: string) => {
+    let message: any;
     try {
-      const message = JSON.parse(data.toString());
-      logger.debug('ws_message', { type: message?.type, playerId, roomId });
+      message = JSON.parse(data.toString());
+    } catch {
+      ws.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: 'Invalid message format'
+        })
+      );
+      return;
+    }
 
+    logger.debug('ws_message', { type: message?.type, playerId, roomId });
+
+    try {
       switch (message.type) {
         case 'CREATE_ROOM':
-          handleCreateRoom(message);
+          await handleCreateRoom(message);
           break;
         case 'JOIN_ROOM':
-          handleJoinRoom(message);
+          await handleJoinRoom(message);
           break;
         case 'START_GAME':
           handleStartGame();
@@ -70,10 +136,16 @@ wss.on('connection', (ws: WebSocket) => {
           );
       }
     } catch (error) {
+      logger.error('ws_message_handler_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        messageType: message?.type,
+        playerId,
+        roomId
+      });
       ws.send(
         JSON.stringify({
           type: 'ERROR',
-          message: 'Invalid message format'
+          message: 'Server error'
         })
       );
     }
@@ -89,34 +161,95 @@ wss.on('connection', (ws: WebSocket) => {
     logger.warn('ws_error', { playerId, roomId });
   });
 
-  function handleCreateRoom(message: any) {
+  async function authenticate(message: any): Promise<{ id: string; username: string; coins: number } | null> {
+    const token = typeof message?.token === 'string' ? message.token : '';
+    if (!token) {
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Authentication required' }));
+      return null;
+    }
+
+    const decoded = verifyAuthToken(token);
+    if (!decoded) {
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Invalid token' }));
+      return null;
+    }
+
+    let user = null;
+    try {
+      user = await getUserById(decoded.userId);
+    } catch (error) {
+      logger.error('auth_user_lookup_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        userId: decoded.userId
+      });
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Authentication service unavailable' }));
+      return null;
+    }
+    if (!user) {
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'User not found' }));
+      return null;
+    }
+    return user;
+  }
+
+  async function handleCreateRoom(message: any) {
+    const user = await authenticate(message);
+    if (!user) return;
+    if (userAlreadyInActiveRoom(user.id)) {
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'User already in another room' }));
+      return;
+    }
+
     const newRoomId = generateRoomId();
-    const game = new Game(newRoomId);
+    const baseBet = parseBaseBet(message.baseBet);
+    const game = new Game(newRoomId, baseBet);
+    attachCoinSettlementPersistence(game);
     games.set(newRoomId, game);
 
     const id: string = message.playerId || generatePlayerId();
-    const name: string = message.playerName || `Player_${id.substring(0, 4)}`;
+    const name: string = user.username;
     const rid: string = newRoomId;
 
     playerId = id;
     playerName = name;
     roomId = rid;
+    authUserId = user.id;
 
-    game.addPlayer(id, name, ws);
+    const added = game.addPlayer(id, name, ws, user.coins);
+    if (!added) {
+      ws.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: 'Insufficient coins for base bet'
+        })
+      );
+      games.delete(rid);
+      playerId = null;
+      playerName = null;
+      roomId = null;
+      authUserId = null;
+      return;
+    }
+    runtimePlayerToUserId.set(id, user.id);
     playerRooms.set(id, rid);
 
-    logger.info('room_created', { roomId: rid, playerId: id, playerName: name });
+    logger.info('room_created', { roomId: rid, playerId: id, playerName: name, baseBet, coins: user.coins, authUserId: user.id });
     ws.send(
       JSON.stringify({
         type: 'ROOM_CREATED',
         roomId: rid,
         playerId: id,
-        playerName: name
+        playerName: name,
+        baseBet,
+        coins: user.coins
       })
     );
   }
 
-  function handleJoinRoom(message: any) {
+  async function handleJoinRoom(message: any) {
+    const user = await authenticate(message);
+    if (!user) return;
+
     const targetRoomId = message.roomId;
     const game = games.get(targetRoomId);
     if (!game) {
@@ -125,12 +258,17 @@ wss.on('connection', (ws: WebSocket) => {
     }
 
     const requestedPlayerId = message.playerId || generatePlayerId();
-    const requestedPlayerName =
-      message.playerName || `Player_${requestedPlayerId.substring(0, 4)}`;
+    const requestedPlayerName = user.username;
 
     // Reconnect: keep the seat if playerId already exists in this room.
     const existing = game.players.find(p => p.id === requestedPlayerId);
     if (existing) {
+      const mappedUserId = runtimePlayerToUserId.get(requestedPlayerId);
+      if (mappedUserId && mappedUserId !== user.id) {
+        ws.send(JSON.stringify({ type: 'ERROR', message: 'Player identity mismatch' }));
+        return;
+      }
+
       const timer = disconnectTimers.get(requestedPlayerId);
       if (timer) clearTimeout(timer);
       disconnectTimers.delete(requestedPlayerId);
@@ -147,12 +285,15 @@ wss.on('connection', (ws: WebSocket) => {
       playerId = requestedPlayerId;
       playerName = existing.name;
       roomId = targetRoomId;
+      authUserId = user.id;
       playerRooms.set(requestedPlayerId, targetRoomId);
+      runtimePlayerToUserId.set(requestedPlayerId, user.id);
 
       logger.info('player_reconnected', {
         roomId: targetRoomId,
         playerId: requestedPlayerId,
-        playerName: existing.name
+        playerName: existing.name,
+        authUserId: user.id
       });
         ws.send(
           JSON.stringify({
@@ -160,6 +301,8 @@ wss.on('connection', (ws: WebSocket) => {
             roomId: targetRoomId,
             playerId: requestedPlayerId,
             playerName: existing.name,
+            baseBet: game.baseBet,
+            coins: user.coins,
             reconnected: true
           })
         );
@@ -169,27 +312,43 @@ wss.on('connection', (ws: WebSocket) => {
         return;
       }
 
-    // Normal join (only allowed while waiting).
-    playerId = requestedPlayerId;
-    playerName = requestedPlayerName;
-    roomId = targetRoomId;
+    const duplicateAuthInRoom = game.players.some(p => runtimePlayerToUserId.get(p.id) === user.id);
+    if (duplicateAuthInRoom) {
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'User already in room' }));
+      return;
+    }
+    if (userAlreadyInActiveRoom(user.id)) {
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'User already in another room' }));
+      return;
+    }
 
-    const success = game.addPlayer(requestedPlayerId, requestedPlayerName, ws);
+    const success = game.addPlayer(requestedPlayerId, requestedPlayerName, ws, user.coins);
     if (!success) {
       ws.send(
         JSON.stringify({
           type: 'ERROR',
-          message: 'Unable to join room (full or already started)'
+          message: user.coins < game.baseBet
+            ? `Insufficient coins for base bet (${game.baseBet})`
+            : 'Unable to join room (full or already started)'
         })
       );
       return;
     }
 
+    // Join succeeded; bind socket/session identity now.
+    playerId = requestedPlayerId;
+    playerName = requestedPlayerName;
+    roomId = targetRoomId;
+    authUserId = user.id;
     playerRooms.set(requestedPlayerId, targetRoomId);
+    runtimePlayerToUserId.set(requestedPlayerId, user.id);
     logger.info('player_joined', {
       roomId: targetRoomId,
       playerId: requestedPlayerId,
-      playerName: requestedPlayerName
+      playerName: requestedPlayerName,
+      coins: user.coins,
+      baseBet: game.baseBet,
+      authUserId: user.id
     });
       ws.send(
         JSON.stringify({
@@ -197,6 +356,8 @@ wss.on('connection', (ws: WebSocket) => {
           roomId: targetRoomId,
           playerId: requestedPlayerId,
           playerName: requestedPlayerName,
+          baseBet: game.baseBet,
+          coins: user.coins,
           reconnected: false
         })
       );
@@ -282,6 +443,8 @@ wss.on('connection', (ws: WebSocket) => {
 
     logger.info('player_left', { roomId, playerId, playerName });
     playerRooms.delete(playerId);
+    runtimePlayerToUserId.delete(playerId);
+    authUserId = null;
     try {
       ws.close();
     } catch {}
@@ -315,6 +478,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
       playerRooms.delete(pid);
       disconnectTimers.delete(pid);
+      runtimePlayerToUserId.delete(pid);
       logger.info('disconnect_grace_expired_removed', { roomId: actualRoomId, playerId: pid });
     }, DISCONNECT_GRACE_MS);
 

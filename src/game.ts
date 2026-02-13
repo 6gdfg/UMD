@@ -23,6 +23,23 @@ const TURN_TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 12000;
 })();
 
+const DEFAULT_START_COINS = (() => {
+  const n = Number(process.env.DEFAULT_START_COINS);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 100000;
+})();
+
+const DEFAULT_BASE_BET = (() => {
+  const n = Number(process.env.DEFAULT_BASE_BET);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100;
+})();
+
+type MultiplierReason =
+  | 'BOMB'
+  | 'DRAW_CHAIN_GE_4'
+  | 'GANG'
+  | 'WIN_SPECIAL_LAST_HAND'
+  | 'WIN_MEN_QIAN_QING';
+
 export enum GamePhase {
   WAITING = 'waiting',
   PLAYING = 'playing',
@@ -59,6 +76,26 @@ interface ClaimStep {
   actions: PotentialAction[];
 }
 
+export interface CoinSettlementDetail {
+  playerId: string;
+  playerName: string;
+  delta: number;
+  before: number;
+  after: number;
+}
+
+export interface CoinSettlementPayload {
+  roomId: string;
+  winnerId: string;
+  winnerName: string;
+  baseBet: number;
+  multiplier: number;
+  perLoserCost: number;
+  winnerGain: number;
+  reasons: MultiplierReason[];
+  details: CoinSettlementDetail[];
+}
+
 export class Game {
   players: Player[] = [];
   deck: Card[] = [];
@@ -80,13 +117,21 @@ export class Game {
   claimQueue: ClaimStep[] = [];
   claimQueueIndex: number = 0;
   roomId: string;
+  baseBet: number;
+  multiplier: number = 1;
+  multiplierReasons: MultiplierReason[] = [];
+  private playerCoins: Map<string, number> = new Map();
+  private pendingDrawChainDoubled: boolean = false;
+  private mahjongActionPlayers: Set<string> = new Set();
+  private onCoinSettled: ((payload: CoinSettlementPayload) => void | Promise<void>) | null = null;
   hasActiveRound: boolean = false;
   passCount: number = 0;
   private unoTimers: Map<string, NodeJS.Timeout> = new Map();
   private unoDeadlineMsByPlayerId: Map<string, number> = new Map();
 
-  constructor(roomId: string) {
+  constructor(roomId: string, baseBet: number = DEFAULT_BASE_BET) {
     this.roomId = roomId;
+    this.baseBet = Number.isFinite(baseBet) && baseBet > 0 ? Math.floor(baseBet) : DEFAULT_BASE_BET;
     this.deck = shuffleDeck(createDeck());
   }
 
@@ -256,19 +301,70 @@ export class Game {
     return this.claimQueue[this.claimQueueIndex]?.playerId ?? null;
   }
 
-  addPlayer(id: string, name: string, ws: WebSocket): boolean {
+  private normalizeCoins(coins?: number): number {
+    if (!Number.isFinite(coins)) return DEFAULT_START_COINS;
+    return Math.max(0, Math.floor(coins as number));
+  }
+
+  private getCoins(playerId: string): number {
+    return this.playerCoins.get(playerId) ?? DEFAULT_START_COINS;
+  }
+
+  private setCoins(playerId: string, coins: number): void {
+    this.playerCoins.set(playerId, Math.max(0, Math.floor(coins)));
+  }
+
+  private applyMultiplier(reason: MultiplierReason, byPlayerId: string | null = null): void {
+    this.multiplier *= 2;
+    this.multiplierReasons.push(reason);
+
+    logger.info('multiplier_changed', {
+      roomId: this.roomId,
+      reason,
+      byPlayerId,
+      multiplier: this.multiplier
+    });
+
+    this.broadcast({
+      type: 'MULTIPLIER_CHANGED',
+      reason,
+      byPlayerId,
+      multiplier: this.multiplier
+    });
+  }
+
+  setCoinSettlementHandler(handler: ((payload: CoinSettlementPayload) => void | Promise<void>) | null): void {
+    this.onCoinSettled = handler;
+  }
+
+  addPlayer(id: string, name: string, ws: WebSocket, initialCoins?: number): boolean {
     if (this.gamePhase !== GamePhase.WAITING) return false;
     if (this.players.length >= 8) return false;
     if (this.players.some(p => p.id === id)) return false;
 
     const player = createPlayer(id, name, ws);
-    this.players.push(player);
+    const normalizedCoins = this.normalizeCoins(initialCoins);
+    if (normalizedCoins < this.baseBet) {
+      return false;
+    }
 
-    logger.info('player_joined_room', { roomId: this.roomId, playerId: id, playerName: name });
+    this.players.push(player);
+    this.setCoins(id, normalizedCoins);
+
+    logger.info('player_joined_room', {
+      roomId: this.roomId,
+      playerId: id,
+      playerName: name,
+      coins: normalizedCoins,
+      baseBet: this.baseBet
+    });
     
     this.broadcast({
       type: 'PLAYER_JOINED',
-      player: getPlayerPublicInfo(player),
+      player: {
+        ...getPlayerPublicInfo(player),
+        coins: this.getCoins(player.id)
+      },
       playerCount: this.players.length
     });
 
@@ -277,6 +373,8 @@ export class Game {
 
   removePlayer(playerId: string): void {
     this.clearUnoTimer(playerId);
+    this.playerCoins.delete(playerId);
+    this.mahjongActionPlayers.delete(playerId);
     const index = this.players.findIndex(p => p.id === playerId);
     if (index !== -1) {
       const wasCurrent = index === this.currentPlayerIndex;
@@ -325,6 +423,18 @@ export class Game {
     if (this.gamePhase !== GamePhase.WAITING) return false;
 
     for (const player of this.players) {
+      if (this.getCoins(player.id) < this.baseBet) {
+        logger.warn('start_game_failed_insufficient_coins', {
+          roomId: this.roomId,
+          playerId: player.id,
+          coins: this.getCoins(player.id),
+          baseBet: this.baseBet
+        });
+        return false;
+      }
+    }
+
+    for (const player of this.players) {
       const cards = this.deck.splice(0, 13);
       dealCards(player, cards);
     }
@@ -334,10 +444,16 @@ export class Game {
 
     logger.info('game_started', { roomId: this.roomId, playerCount: this.players.length });
     this.hasActiveRound = false;
+    this.multiplier = 1;
+    this.multiplierReasons = [];
+    this.pendingDrawChainDoubled = false;
+    this.mahjongActionPlayers.clear();
 
     this.broadcast({
       type: 'GAME_STARTED',
-      currentPlayerId: this.players[this.currentPlayerIndex].id
+      currentPlayerId: this.players[this.currentPlayerIndex].id,
+      baseBet: this.baseBet,
+      multiplier: this.multiplier
     });
 
     this.scheduleTurnTimer();
@@ -502,10 +618,15 @@ export class Game {
     this.hasActiveRound = true;
     this.passCount = 0;
 
+    if (handType === HandType.BOMB) {
+      this.applyMultiplier('BOMB', player.id);
+    }
+
     if (this.pendingDrawCount > 0 && handType === HandType.BOMB) {
       // Bomb overrides the pending draw chain.
       this.pendingDrawCount = 0;
       this.pendingDrawType = null;
+      this.pendingDrawChainDoubled = false;
     }
 
     if (handType !== HandType.SINGLE) {
@@ -680,6 +801,7 @@ export class Game {
     this.currentColor = null;
     this.pendingDrawCount = 0;
     this.pendingDrawType = null;
+    this.pendingDrawChainDoubled = false;
     this.pendingEffect = null;
 
     const leaderIndex = this.players.findIndex(p => p.id === leaderId);
@@ -1114,6 +1236,11 @@ export class Game {
     }
 
     if (draw2Count > 0 || draw4Count > 0) {
+      if (this.pendingDrawCount >= 4 && !this.pendingDrawChainDoubled) {
+        this.pendingDrawChainDoubled = true;
+        this.applyMultiplier('DRAW_CHAIN_GE_4', player.id);
+      }
+
       this.broadcast({
         type: 'PENDING_DRAW_UPDATED',
         count: this.pendingDrawCount
@@ -1359,6 +1486,7 @@ export class Game {
       return 0;
     });
     player.meldedCards.push(meldedSet);
+    this.mahjongActionPlayers.add(player.id);
 
       this.broadcast({
         type: 'CHI_PERFORMED',
@@ -1434,6 +1562,7 @@ export class Game {
     }
     const meldedSet = [...action.cards, action.targetCard];
     player.meldedCards.push(meldedSet);
+    this.mahjongActionPlayers.add(player.id);
 
       this.broadcast({
         type: 'PENG_PERFORMED',
@@ -1525,6 +1654,7 @@ export class Game {
     }
     const meldedSet = [...action.cards, action.targetCard];
     player.meldedCards.push(meldedSet);
+    this.mahjongActionPlayers.add(player.id);
 
       this.broadcast({
         type: 'GANG_PERFORMED',
@@ -1536,6 +1666,7 @@ export class Game {
         playerId: player.id,
         target: { color: action.targetCard.color, type: action.targetCard.type, value: action.targetCard.value }
       });
+      this.applyMultiplier('GANG', player.id);
 
     // 处理+2或+4的杠
     if (action.targetCard.type === CardType.DRAW_TWO) {
@@ -1584,6 +1715,7 @@ export class Game {
         const count = this.pendingDrawCount;
         this.pendingDrawCount = 0;
         this.pendingDrawType = null;
+        this.pendingDrawChainDoubled = false;
         logger.info('draw_penalty_accepted', { roomId: this.roomId, playerId: player.id, count });
         this.drawCardsForPlayer(player, count);
         this.broadcast({
@@ -1622,6 +1754,7 @@ export class Game {
         const count = this.pendingDrawCount;
         this.pendingDrawCount = 0;
         this.pendingDrawType = null;
+        this.pendingDrawChainDoubled = false;
         logger.info('draw_penalty_accepted', { roomId: this.roomId, playerId: player.id, count });
         this.drawCardsForPlayer(player, count);
         this.broadcast({
@@ -1754,6 +1887,7 @@ export class Game {
           const count = this.pendingDrawCount;
           this.pendingDrawCount = 0;
           this.pendingDrawType = null;
+          this.pendingDrawChainDoubled = false;
           this.drawCardsForPlayer(current, count);
           this.broadcast({
             type: 'DRAW_PENALTY_FORCED',
@@ -1799,6 +1933,54 @@ export class Game {
     return (this.currentPlayerIndex + this.turnDirection + this.players.length) % this.players.length;
   }
 
+  private settleCoins(winnerId: string): {
+    baseBet: number;
+    multiplier: number;
+    perLoserCost: number;
+    winnerGain: number;
+    details: CoinSettlementDetail[];
+  } {
+    const perLoserCost = this.baseBet * this.multiplier;
+    const details: CoinSettlementDetail[] = [];
+    let winnerGain = 0;
+
+    for (const player of this.players) {
+      if (player.id === winnerId) continue;
+      const before = this.getCoins(player.id);
+      const pay = Math.min(before, perLoserCost);
+      const after = before - pay;
+      this.setCoins(player.id, after);
+      winnerGain += pay;
+      details.push({
+        playerId: player.id,
+        playerName: player.name,
+        delta: -pay,
+        before,
+        after
+      });
+    }
+
+    const winner = this.players.find(p => p.id === winnerId);
+    const winnerBefore = this.getCoins(winnerId);
+    const winnerAfter = winnerBefore + winnerGain;
+    this.setCoins(winnerId, winnerAfter);
+    details.push({
+      playerId: winnerId,
+      playerName: winner?.name || 'Unknown',
+      delta: winnerGain,
+      before: winnerBefore,
+      after: winnerAfter
+    });
+
+    return {
+      baseBet: this.baseBet,
+      multiplier: this.multiplier,
+      perLoserCost,
+      winnerGain,
+      details
+    };
+  }
+
   /**
    * 结束游戏
    */
@@ -1806,6 +1988,61 @@ export class Game {
     this.gamePhase = GamePhase.ENDED;
     this.clearTurnTimer();
     const winner = this.players.find(p => p.id === winnerId);
+
+    const winnerUsedOnlySpecialInFinalHand =
+      this.lastPlayedBy === winnerId &&
+      this.lastPlayedHand.length > 0 &&
+      this.lastPlayedHand.every(c => c.type !== CardType.NUMBER);
+
+    if (winnerUsedOnlySpecialInFinalHand) {
+      this.applyMultiplier('WIN_SPECIAL_LAST_HAND', winnerId);
+    }
+
+    if (!this.mahjongActionPlayers.has(winnerId)) {
+      this.applyMultiplier('WIN_MEN_QIAN_QING', winnerId);
+    }
+
+    const settlement = this.settleCoins(winnerId);
+    logger.info('coin_settled', {
+      roomId: this.roomId,
+      winnerId,
+      baseBet: settlement.baseBet,
+      multiplier: settlement.multiplier,
+      perLoserCost: settlement.perLoserCost,
+      winnerGain: settlement.winnerGain
+    });
+
+    if (this.onCoinSettled) {
+      try {
+        const maybePromise = this.onCoinSettled({
+          roomId: this.roomId,
+          winnerId,
+          winnerName: winner?.name || 'Unknown',
+          baseBet: settlement.baseBet,
+          multiplier: settlement.multiplier,
+          perLoserCost: settlement.perLoserCost,
+          winnerGain: settlement.winnerGain,
+          reasons: [...this.multiplierReasons],
+          details: settlement.details
+        });
+        if (maybePromise && typeof (maybePromise as Promise<void>).catch === 'function') {
+          (maybePromise as Promise<void>).catch((error: unknown) => {
+            logger.error('coin_settlement_persist_failed', {
+              roomId: this.roomId,
+              winnerId,
+              error: error instanceof Error ? error.message : String(error)
+            });
+          });
+        }
+      } catch (error) {
+        logger.error('coin_settlement_handler_failed', {
+          roomId: this.roomId,
+          winnerId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
     for (const timer of this.unoTimers.values()) {
       clearTimeout(timer);
     }
@@ -1813,9 +2050,24 @@ export class Game {
     this.unoDeadlineMsByPlayerId.clear();
 
     this.broadcast({
+      type: 'COIN_SETTLED',
+      winnerId,
+      winnerName: winner?.name || 'Unknown',
+      baseBet: settlement.baseBet,
+      multiplier: settlement.multiplier,
+      perLoserCost: settlement.perLoserCost,
+      winnerGain: settlement.winnerGain,
+      reasons: [...this.multiplierReasons],
+      details: settlement.details
+    });
+
+    this.broadcast({
       type: 'GAME_OVER',
       winner: winnerId,
-      winnerName: winner?.name || 'Unknown'
+      winnerName: winner?.name || 'Unknown',
+      coinSettlement: settlement,
+      multiplier: this.multiplier,
+      multiplierReasons: [...this.multiplierReasons]
     });
   }
 
@@ -1850,6 +2102,10 @@ export class Game {
         type: 'GAME_STATE',
         gameState: {
           phase: this.gamePhase,
+          roomId: this.roomId,
+          baseBet: this.baseBet,
+          multiplier: this.multiplier,
+          multiplierReasons: [...this.multiplierReasons],
           currentPlayerId: this.players[this.currentPlayerIndex]?.id,
           turnDirection: this.turnDirection,
           turnDeadlineMs: this.turnDeadlineMs,
@@ -1864,10 +2120,14 @@ export class Game {
             p.id === player.id
               ? {
                   ...getPlayerPrivateInfo(p),
+                  coins: this.getCoins(p.id),
                   unoDeadlineMs: this.unoDeadlineMsByPlayerId.get(p.id) ?? null,
                   unoCallTimeoutMs: UNO_CALL_TIMEOUT_MS
                 }
-              : getPlayerPublicInfo(p)
+              : {
+                  ...getPlayerPublicInfo(p),
+                  coins: this.getCoins(p.id)
+                }
           )
         }
       });

@@ -10,14 +10,24 @@
     "watch": "tsc -w",
     "verify:rules": "node scripts/verify-rules.js"
   },
-  "keywords": ["websocket", "game", "card-game", "uno", "mahjong"],
+  "keywords": [
+    "websocket",
+    "game",
+    "card-game",
+    "uno",
+    "mahjong"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.18.0",
     "ws": "^8.16.0"
   },
   "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.11.0",
+    "@types/pg": "^8.16.0",
     "@types/ws": "^8.5.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
