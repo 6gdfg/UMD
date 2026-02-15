@@ -162,7 +162,8 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   async function authenticate(message: any): Promise<{ id: string; username: string; coins: number } | null> {
-    const token = typeof message?.token === 'string' ? message.token : '';
+    const rawToken = typeof message?.token === 'string' ? message.token : '';
+    const token = rawToken.replace(/^Bearer\s+/i, '').trim();
     if (!token) {
       ws.send(JSON.stringify({ type: 'ERROR', message: 'Authentication required' }));
       return null;
